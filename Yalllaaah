@@ -1,0 +1,274 @@
+"""
+YOLO Processor Module
+Supports Vehicle and Person counting, Line Crossing, and Zone Occupancy.
+"""
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import supervision as sv
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional, Set
+from collections import defaultdict
+import time
+
+@dataclass
+class DetectionCount:
+    """Generic detection and counting results"""
+    total: int = 0  # Line: Cumulative total, Zone: Current Occupancy Total
+    
+    # Class breakdown
+    counts_by_class: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    
+    # Line Crossing specific
+    in_count: int = 0
+    out_count: int = 0
+    
+    # History
+    timestamps: List[float] = field(default_factory=list)
+    vehicle_types: List[str] = field(default_factory=list) # Keep name for backward compat (log list)
+    directions: List[str] = field(default_factory=list)
+
+
+class LineZone:
+    """Line crossing detection logic"""
+    def __init__(self, start: Tuple[int, int], end: Tuple[int, int]):
+        self.start = np.array(start)
+        self.end = np.array(end)
+        self.vector = self.end - self.start
+        
+    def is_crossing(self, prev_pos: np.ndarray, curr_pos: np.ndarray) -> Optional[str]:
+        """Check if movement crossed the line"""
+        # Cross product method
+        def side(point):
+            return (point[1] - self.start[1]) * self.vector[0] - (point[0] - self.start[0]) * self.vector[1]
+        
+        prev_side = side(prev_pos)
+        curr_side = side(curr_pos)
+        
+        if prev_side * curr_side < 0:
+            # Check bounds
+            t = prev_side / (prev_side - curr_side)
+            cross_point = prev_pos + t * (curr_pos - prev_pos)
+            
+            min_x, max_x = min(self.start[0], self.end[0]), max(self.start[0], self.end[0])
+            min_y, max_y = min(self.start[1], self.end[1]), max(self.start[1], self.end[1])
+            
+            if min_x <= cross_point[0] <= max_x and min_y <= cross_point[1] <= max_y:
+                return 'in' if curr_side > 0 else 'out'
+        return None
+
+class RegionZone:
+    """Rectangular Region Occupancy"""
+    def __init__(self, x1, y1, x2, y2):
+        self.x1 = min(x1, x2)
+        self.y1 = min(y1, y2)
+        self.x2 = max(x1, x2)
+        self.y2 = max(y1, y2)
+        
+    def is_inside(self, point: np.ndarray) -> bool:
+        x, y = point
+        return self.x1 <= x <= self.x2 and self.y1 <= y <= self.y2
+    
+    def get_coords(self):
+        return (self.x1, self.y1), (self.x2, self.y2)
+
+class YOLOProcessor:
+    """
+    Generic YOLO processor for tracking and counting.
+    """
+    
+    # Predefined configs
+    CONFIGS = {
+        'vehicle': {
+            'classes': {2: 'car', 3: 'motorcycle', 5: 'bus', 6: 'truck', 7: 'truck'},
+            'colors': {
+                'car': (255, 107, 107),
+                'motorcycle': (78, 205, 196),
+                'bus': (69, 183, 209),
+                'truck': (150, 206, 180)
+            }
+        },
+        'person': {
+            'classes': {0: 'person'},
+            'colors': {'person': (255, 150, 255)}
+        }
+    }
+    
+    def __init__(self, model_name="yolov8l.pt", config_name="vehicle", mode="line", confidence=0.3):
+        self.model = YOLO(model_name)
+        self.confidence = confidence
+        self.mode = mode  # 'line' or 'zone'
+        
+        # Load config
+        self.config = self.CONFIGS.get(config_name, self.CONFIGS['vehicle'])
+        self.target_classes = self.config['classes']
+        self.target_ids = list(self.target_classes.keys())
+        
+        # Tracker
+        self.tracker = sv.ByteTrack()
+        self.track_history = defaultdict(list)
+        
+        # State
+        self.counted_ids = set() # For line mode (cumulative)
+        self.flash_timers = {}   # For visual effect
+        self.current_counts = DetectionCount()
+        
+        # Geometry
+        self.line_zone: Optional[LineZone] = None
+        self.region_zone: Optional[RegionZone] = None
+        
+        self.start_time = time.time()
+        
+    def set_line(self, start, end):
+        self.line_zone = LineZone(start, end)
+        
+    def set_region(self, x1, y1, x2, y2):
+        self.region_zone = RegionZone(x1, y1, x2, y2)
+        
+    def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, DetectionCount]:
+        results = self.model(frame, conf=self.confidence, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(results)
+        
+        # Filter classes
+        mask = np.isin(detections.class_id, self.target_ids)
+        detections = detections[mask]
+        
+        # Track
+        detections = self.tracker.update_with_detections(detections)
+        
+        # Logic based on mode
+        if self.mode == "line" and self.line_zone:
+            self._process_line_mode(detections)
+        elif self.mode == "zone" and self.region_zone:
+            self._process_zone_mode(detections)
+            
+        # Draw
+        annotated = self._annotate(frame, detections)
+        return annotated, self.current_counts
+    
+    def _process_line_mode(self, detections):
+        if detections.tracker_id is None: return
+        
+        for i, tracker_id in enumerate(detections.tracker_id):
+            if tracker_id is None: continue
+            
+            # Center point
+            bbox = detections.xyxy[i]
+            center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+            
+            self.track_history[tracker_id].append(center)
+            if len(self.track_history[tracker_id]) > 30:
+                self.track_history[tracker_id].pop(0)
+                
+            # Check crossing
+            if len(self.track_history[tracker_id]) >= 2 and tracker_id not in self.counted_ids:
+                pts = self.track_history[tracker_id]
+                # Check last few segments
+                for j in range(1, min(5, len(pts))):
+                    start_pt = pts[-(j+1)]
+                    end_pt = pts[-j]
+                    crossing = self.line_zone.is_crossing(start_pt, end_pt)
+                    
+                    if crossing:
+                        self.counted_ids.add(tracker_id)
+                        self.flash_timers[tracker_id] = 10
+                        
+                        class_name = self.target_classes.get(detections.class_id[i], 'unknown')
+                        
+                        # Update counts
+                        self.current_counts.total += 1
+                        self.current_counts.counts_by_class[class_name] += 1
+                        self.current_counts.timestamps.append(time.time() - self.start_time)
+                        self.current_counts.vehicle_types.append(class_name)
+                        
+                        if crossing == 'in':
+                            self.current_counts.in_count += 1
+                            self.current_counts.directions.append('in')
+                        else:
+                            self.current_counts.out_count += 1
+                            self.current_counts.directions.append('out')
+                        break
+
+    def _process_zone_mode(self, detections):
+        # Reset current frame counts for zone mode (Occupancy)
+        current_zone_total = 0
+        current_class_counts = defaultdict(int)
+        self.inside_zone_ids = set()  # Track who's inside this frame
+        
+        if detections.tracker_id is None: 
+            self.current_counts.total = 0
+            self.current_counts.counts_by_class = current_class_counts
+            return
+
+        for i, tracker_id in enumerate(detections.tracker_id):
+            bbox = detections.xyxy[i]
+            center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+            
+            if self.region_zone.is_inside(center):
+                current_zone_total += 1
+                class_name = self.target_classes.get(detections.class_id[i], 'unknown')
+                current_class_counts[class_name] += 1
+                self.inside_zone_ids.add(tracker_id)
+                
+        self.current_counts.total = current_zone_total
+        self.current_counts.counts_by_class = current_class_counts
+
+    def _annotate(self, frame, detections):
+        annotated = frame.copy()
+        h, w = frame.shape[:2]
+        scale = max(w, h) / 1920.0
+        scale = max(0.5, min(scale, 2.0))
+        
+        # Config colors
+        colors = self.config.get('colors', {})
+        
+        # Zone mode colors
+        inside_color = (0, 255, 0)    # Green for inside zone
+        outside_color = (128, 128, 128)  # Gray for outside zone
+        
+        # Draw detections
+        if detections.tracker_id is not None:
+            for i, (bbox, cls_id, trk_id) in enumerate(zip(detections.xyxy, detections.class_id, detections.tracker_id)):
+                cls_name = self.target_classes.get(cls_id, 'unknown')
+                
+                # Determine color based on mode
+                if self.mode == "zone":
+                    # Zone mode: Green if inside, Gray if outside
+                    if hasattr(self, 'inside_zone_ids') and trk_id in self.inside_zone_ids:
+                        color = inside_color
+                        thickness = 4
+                    else:
+                        color = outside_color
+                        thickness = 2
+                else:
+                    # Line mode: Use flash effect or base color
+                    base_color = colors.get(cls_name, (200, 200, 200))
+                    if trk_id in self.flash_timers and self.flash_timers[trk_id] > 0:
+                        color = (0, 255, 0)  # Green flash
+                        self.flash_timers[trk_id] -= 1
+                        thickness = 4
+                    else:
+                        color = base_color
+                        thickness = 2
+                    
+                x1, y1, x2, y2 = map(int, bbox)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+                
+                # Label
+                label = f"{cls_name} {trk_id}"
+                font_scale = 0.6 * scale
+                cv2.putText(annotated, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 2)
+                
+        # Draw Zone/Line
+        if self.mode == "line" and self.line_zone:
+            cv2.line(annotated, tuple(self.line_zone.start.astype(int)), tuple(self.line_zone.end.astype(int)), (0, 255, 255), 3)
+        elif self.mode == "zone" and self.region_zone:
+            pt1, pt2 = self.region_zone.get_coords()
+            # Draw semi-transparent rect
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, pt1, pt2, (255, 100, 0), -1)
+            cv2.addWeighted(overlay, 0.2, annotated, 0.8, 0, annotated)
+            cv2.rectangle(annotated, pt1, pt2, (255, 100, 0), 3)
+            
+        return annotated

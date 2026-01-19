@@ -1,0 +1,237 @@
+"""
+YOLO Multi-Mode Dashboard
+Supports Vehicle/Person Line Counting and Zone Occupancy.
+"""
+
+import streamlit as st
+import cv2
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import tempfile
+import os
+import time
+from vehicle_counter import YOLOProcessor, DetectionCount
+
+# Sayfa yapılandırması
+st.set_page_config(
+    page_title="👁️ YOLO AI Vision",
+    page_icon="👁️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .stApp { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); }
+    .main-title {
+        text-align: center; font-size: 3rem; font-weight: 800;
+        background: linear-gradient(90deg, #00d4ff, #7c3aed, #f472b6);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        text-shadow: 0 0 30px rgba(0, 212, 255, 0.5); margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        text-align: center; font-size: 1.5rem; font-weight: 600;
+        color: #e2e8f0; margin-bottom: 1.5rem; letter-spacing: 1px;
+    }
+    .metric-card {
+        background: rgba(255,255,255,0.05); border-radius: 15px; padding: 1rem;
+        border: 1px solid rgba(255,255,255,0.1); text-align: center;
+    }
+    .metric-value { font-size: 2.5rem; font-weight: 700; color: #00d4ff; }
+    .metric-label { color: #94a3b8; font-size: 0.9rem; text-transform: uppercase; }
+</style>
+""", unsafe_allow_html=True)
+
+def create_donut_chart(counts: DetectionCount) -> go.Figure:
+    """Class distribution chart"""
+    labels = list(counts.counts_by_class.keys())
+    values = list(counts.counts_by_class.values())
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=labels, values=values, hole=0.6,
+        marker=dict(colors=None, line=dict(color='#1a1a2e', width=2)),
+        textinfo='percent+label'
+    )])
+    fig.update_layout(
+        showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=0, r=0, t=0, b=0), height=250,
+        annotations=[dict(text=f'<b>{counts.total}</b>', x=0.5, y=0.5, font_size=20, showarrow=False)]
+    )
+    return fig
+
+def main():
+    st.markdown('<h1 class="main-title">👁️ YOLO AI Vision</h1>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Yapay Zeka Okulum / Dr. Murat ALTUN</div>', unsafe_allow_html=True)
+    
+    if 'processing' not in st.session_state: st.session_state.processing = False
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Ayarlar")
+        
+        # Mode Selection
+        app_mode = st.selectbox(
+            "Uygulama Modu",
+            ["Araç Sayımı (Çizgi)", "İnsan Sayımı (Çizgi)", "İnsan Yoğunluğu (Alan)"]
+        )
+        
+        # Determine internal config
+        if app_mode == "Araç Sayımı (Çizgi)":
+            proc_mode = "line"
+            proc_config = "vehicle"
+        elif app_mode == "İnsan Sayımı (Çizgi)":
+            proc_mode = "line"
+            proc_config = "person"
+        else:
+            proc_mode = "zone"
+            proc_config = "person"
+            
+        st.markdown("---")
+        
+        # Video Source
+        video_source = st.radio("Kaynak", ["Varsayılan Video", "Video Yükle", "Kamera"])
+        video_path = None
+        use_camera = False
+        
+        if video_source == "Varsayılan Video":
+            # Proje dizininde data klasörü içinde video aranır
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            video_path = os.path.join(base_dir, "data", "sample_video.mp4")
+            
+            # Eğer dosya yoksa uyar
+            if not os.path.exists(video_path):
+                st.warning(f"Varsayılan video bulunamadı: {video_path}. Lütfen 'Video Yükle' seçeneğini kullanın veya 'data/sample_video.mp4' yoluna bir video ekleyin.")
+        elif video_source == "Video Yükle":
+            uploaded = st.file_uploader("Video", type=['mp4','avi'])
+            if uploaded:
+                tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                tfile.write(uploaded.read())
+                video_path = tfile.name
+        else:
+            use_camera = True
+            camera_index = st.number_input("Kamera ID", 0, 5, 0)
+
+        # Geometry Controls
+        st.markdown("#### 📐 Bölge Ayarları")
+        
+        # Get frame dims helper
+        ref_w, ref_h = 1280, 720
+        if video_path and os.path.exists(video_path):
+            vc = cv2.VideoCapture(video_path)
+            ref_w = int(vc.get(3))
+            ref_h = int(vc.get(4))
+            vc.release()
+            
+        geometry_settings = {}
+        
+        if proc_mode == "line":
+            st.info(f"Mod: Çizgi Geçişi ({ref_w}x{ref_h})")
+            y_pos = st.slider("Çizgi Y", 0, ref_h, ref_h//2)
+            margin = st.slider("Kenar Boşluğu", 0, ref_w//2, 0)
+            geometry_settings['start'] = (margin, y_pos)
+            geometry_settings['end'] = (ref_w - margin, y_pos)
+        else:
+            st.info(f"Mod: Alan Yoğunluğu ({ref_w}x{ref_h})")
+            col_z1, col_z2 = st.columns(2)
+            with col_z1:
+                x_min = st.number_input("X Min", 0, ref_w, int(ref_w*0.2))
+                y_min = st.number_input("Y Min", 0, ref_h, int(ref_h*0.2))
+            with col_z2:
+                w_rect = st.number_input("Genişlik", 10, ref_w, int(ref_w*0.6))
+                h_rect = st.number_input("Yükseklik", 10, ref_h, int(ref_h*0.6))
+            
+            geometry_settings['rect'] = (x_min, y_min, x_min+w_rect, y_min+h_rect)
+
+        # Model Config
+        st.markdown("---")
+        model_name = st.selectbox("Model", ["yolov8l.pt", "yolo26x.pt", "yolov8m.pt", "yolov8n.pt"])
+        conf = st.slider("Güven Eşiği", 0.1, 1.0, 0.3)
+        skip_frames = st.slider("Kare Atlama", 1, 5, 1, help="Performans için kaç kare atlansın")
+
+    # Main Area
+    col_vid, col_stat = st.columns([2, 1])
+    
+    with col_vid:
+        st.markdown("### 📹 Canlı Görüntü")
+        frame_placeholder = st.empty()
+        
+        sub_c1, sub_c2, sub_c3 = st.columns(3)
+        start_btn = sub_c1.button("▶️ Başlat", use_container_width=True)
+        stop_btn = sub_c2.button("⏹️ Durdur", use_container_width=True)
+        
+    with col_stat:
+        st.markdown("### 📊 Analiz")
+        count_placeholder = st.empty()
+        chart_placeholder = st.empty()
+
+
+    # Logic
+    if start_btn:
+        st.session_state.processing = True
+        
+        processor = YOLOProcessor(model_name=model_name, config_name=proc_config, mode=proc_mode, confidence=conf)
+        
+        if proc_mode == "line":
+            processor.set_line(geometry_settings['start'], geometry_settings['end'])
+        else:
+            r = geometry_settings['rect']
+            processor.set_region(r[0], r[1], r[2], r[3])
+            
+        if use_camera:
+            cap = cv2.VideoCapture(camera_index)
+        else:
+            cap = cv2.VideoCapture(video_path)
+        
+        frame_idx = 0
+        while cap.isOpened() and st.session_state.processing:
+            ret, frame = cap.read()
+            if not ret: break
+            
+            frame_idx += 1
+            
+            # Frame skip for performance
+            if frame_idx % skip_frames != 0:
+                continue
+            
+            # Process
+            annotated, counts = processor.process_frame(frame)
+            
+            # Display
+            frame_placeholder.image(annotated, channels="BGR", use_container_width=True)
+            
+            # Stats Display
+            with count_placeholder.container():
+                label_text = "TOPLAM GEÇİŞ" if proc_mode == "line" else "ANLIK KİŞİ SAYISI"
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-value">{counts.total}</div>
+                    <div class="metric-label">{label_text}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Details
+                st.markdown("---")
+                if proc_mode == "line":
+                    c1, c2 = st.columns(2)
+                    c1.metric("⬇️ Giriş", counts.in_count)
+                    c2.metric("⬆️ Çıkış", counts.out_count)
+                
+                # Class breakdown
+                for cls, val in counts.counts_by_class.items():
+                    st.metric(f"🔹 {cls}", val)
+                    
+            # Chart
+            with chart_placeholder.container():
+                if counts.counts_by_class:
+                    st.plotly_chart(create_donut_chart(counts), use_container_width=True, key=f"donut_{frame_idx}")
+                    
+        cap.release()
+        st.session_state.processing = False
+
+    if stop_btn:
+        st.session_state.processing = False
+
+if __name__ == "__main__":
+    main()
