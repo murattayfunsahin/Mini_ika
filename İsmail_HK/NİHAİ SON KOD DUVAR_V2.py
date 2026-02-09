@@ -6,7 +6,7 @@ import threading
 from collections import deque
 
 # ==============================================================================
-# 🏎️ PID KONTROLCÜ SINIFI (PROFESYONEL SÜRÜŞÜN SIRRI)
+#  PID KONTROLCÜ SINIFI (PROFESYONEL SÜRÜŞÜN SIRRI)
 # ==============================================================================
 class PIDController:
     def __init__(self, Kp, Ki, Kd):
@@ -35,7 +35,7 @@ class PIDController:
         return int(output)
 
 # ==============================================================================
-# 🚀 MULTI-THREADED KAMERA SINIFI (FPS ARTIRICI)
+#  MULTI-THREADED KAMERA SINIFI (FPS ARTIRICI)
 # ==============================================================================
 class VideoStream:
     def __init__(self, src=0, width=640, height=480):
@@ -63,7 +63,7 @@ class VideoStream:
         self.stream.release()
 
 # ==============================================================================
-# ⚙️ KONFİGÜRASYON (AYARLAR)
+#  KONFİGÜRASYON (AYARLAR)
 # ==============================================================================
 class Config:
     FRAME_WIDTH = 640
@@ -85,7 +85,7 @@ class Config:
     LANE_WIDTH = 380
 
 # ==============================================================================
-# 📡 PICO İLE HABERLEŞME
+#  PICO İLE HABERLEŞME
 # ==============================================================================
 try:
     ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
@@ -105,7 +105,7 @@ def send_command(speed, angle):
         except: pass
 
 # ==============================================================================
-# 🛠️ GELİŞMİŞ GÖRÜNTÜ İŞLEME & DİNAMİK ROI
+#  GELİŞMİŞ GÖRÜNTÜ İŞLEME & DİNAMİK ROI
 # ==============================================================================
 def preprocess_image(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -176,7 +176,7 @@ def make_coords(image, line_params):
     return ((x1, y1), (x2, y2))
 
 # ==============================================================================
-# 📊 PROFESYONEL HUD (DASHBOARD)
+#  PROFESYONEL HUD (DASHBOARD)
 # ==============================================================================
 def draw_dashboard(image, error, pid_out, fps, roi_poly):
     h, w = image.shape[:2]
@@ -205,7 +205,7 @@ def draw_dashboard(image, error, pid_out, fps, roi_poly):
     return image
 
 # ==============================================================================
-# 🏁 ANA PROGRAM (MAIN LOOP)
+#  ANA PROGRAM (MAIN LOOP)
 # ==============================================================================
 def main():
     # 1. Sistem Başlatılıyor
