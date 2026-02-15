@@ -1,0 +1,348 @@
+# Raspberry Pi 4 ↔ Raspberry Pi Pico W USB Serial Haberleşme Kurulumu (Günlük Özet)
+
+Bu doküman, Raspberry Pi 4 ile Raspberry Pi Pico W arasında USB üzerinden
+seri haberleşmenin sıfırdan kurulmasını ve LED kontrolünün Pi 4’ten
+başarıyla yapılmasını özetler.
+
+Amaç:
+- Pico W üzerinde MicroPython çalıştırmak
+- Pico W’yi Pi 4’e USB ile bağlamak
+- Pi 4’ten Pico’ya komut göndermek (on/off)
+- Pico üzerindeki LED’i Pi 4’ten kontrol etmek
+
+--------------------------------------------------
+
+1. Donanım Yapısı
+
+- Raspberry Pi 4 (Raspberry Pi OS / Debian trixie)
+- Raspberry Pi Pico W
+- Pico W → Pi 4 bağlantısı USB kablo ile yapılır
+- USB hem güç hem veri (USB CDC / Serial) sağlar
+
+--------------------------------------------------
+
+2. Pico W Tarafı (MicroPython)
+
+2.1 MicroPython Kontrolü
+
+Thonny üzerinden Pico W’ye bağlanıldığında şu çıktı alındı:
+
+MicroPython v1.27.0 on 2025-12-09; Raspberry Pi Pico W with RP2040
+>>>
+
+Bu çıktı:
+- MicroPython yüklü
+- Pico W çalışır durumda
+- REPL erişimi var
+
+--------------------------------------------------
+
+2.2 Thonny Problemi
+
+- Thonny, Unicode / encoding hataları nedeniyle Pico’ya dosya kaydederken
+  hata verdi.
+- Bu yüzden Thonny dosya kopyalama için kullanılmadı.
+- Dosyalar Pico’ya terminal üzerinden mpremote ile yüklendi.
+
+--------------------------------------------------
+
+3. Pi 4 Tarafı (Linux)
+
+3.1 USB Serial Port
+
+Pico W, Pi 4 tarafından şu şekilde görüldü:
+
+/dev/ttyACM0
+
+Bu port USB CDC seri haberleşme için kullanıldı.
+
+--------------------------------------------------
+
+3.2 PEP 668 Problemi
+
+- Raspberry Pi OS, sistem Python’unu koruyor.
+- pip install doğrudan çalışmıyor (externally-managed-environment hatası).
+- Çözüm: Python sanal ortamı (venv).
+
+--------------------------------------------------
+
+3.3 Sanal Ortam ve mpremote Kurulumu
+
+Aşağıdaki adımlar uygulandı:
+
+sudo apt install -y python3-venv python3-full
+python3 -m venv ~/venv-mp
+source ~/venv-mp/bin/activate
+pip install mpremote
+
+Sonuç:
+- mpremote başarıyla kuruldu
+- Pico’nun dosya sistemine erişim sağlandı
+
+--------------------------------------------------
+
+4. Pico W main.py (Komut Dinleyen Kod)
+
+Bu dosya Pi 4 üzerinde yazıldı ve mpremote ile Pico’nun içine kopyalandı.
+
+Özellikler:
+- USB serial üzerinden gelen komutları dinler
+- on / off komutlarını alır
+- Pico W üzerindeki LED’i kontrol eder
+- Non-blocking çalışır (uselect.poll)
+- Hem "LED" hem GP25 desteklenir (kart farklarına karşı)
+
+Kod:
+
+import time, sys
+from machine import Pin
+import uselect
+
+leds = []
+try:
+    leds.append(Pin("LED", Pin.OUT))
+except:
+    pass
+
+try:
+    leds.append(Pin(25, Pin.OUT))
+except:
+    pass
+
+def set_all(v):
+    for l in leds:
+        l.value(v)
+
+print("READY", "led_count=", len(leds))
+
+poll = uselect.poll()
+poll.register(sys.stdin, uselect.POLLIN)
+
+buf = ""
+while True:
+    if poll.poll(0):
+        ch = sys.stdin.read(1)
+        if ch in ("\n", "\r"):
+            cmd = buf.strip().lower()
+            buf = ""
+            if cmd == "on":
+                set_all(1)
+                print("LED ON")
+            elif cmd == "off":
+                set_all(0)
+                print("LED OFF")
+        else:
+            buf += ch
+    time.sleep(0.01)
+
+Dosya Pico’ya şu komutlarla yüklendi:
+
+mpremote connect /dev/ttyACM0 fs cp main.py :main.py
+mpremote connect /dev/ttyACM0 reset
+
+python3 ~/pico/pico_cmd.py
+
+
+--------------------------------------------------
+
+5. Pi 4 → Pico Komut Gönderme Scripti
+
+Pi 4 üzerinde çalışan Python script:
+
+import serial, time, glob
+
+ports = glob.glob("/dev/ttyACM*")
+PORT = ports[0]
+
+ser = serial.Serial(PORT, 115200, timeout=0.2)
+time.sleep(1.5)
+
+print("Connected:", PORT)
+
+def drain(t=1.0):
+    end = time.time() + t
+    while time.time() < end:
+        line = ser.readline()
+        if line:
+            print("PICO>", line.decode(errors="replace").rstrip())
+
+drain(1.5)
+
+for cmd in ["on", "off", "on", "off"]:
+    ser.write((cmd + "\n").encode())
+    ser.flush()
+    drain(1.0)
+    time.sleep(0.2)
+
+--------------------------------------------------
+
+6. Sonuç
+
+- Pi 4 ↔ Pico W USB Serial haberleşmesi başarıyla kuruldu
+- Pi 4’ten gönderilen on / off komutları Pico tarafından alındı
+- Pico W üzerindeki LED Pi 4’ten kontrol edildi
+- Terminal çıktıları düzgün şekilde alındı
+- Sistem:
+  - telemetri
+  - sensör verisi
+  - komut-kontrol
+  - Teknofest / robotik projeler
+  için hazır hale getirildi
+
+--------------------------------------------------
+
+7. Önemli Notlar
+
+- Thonny açıkken USB serial port kilitlenir, test sırasında kapalı tutulmalıdır
+- POWER LED ile USER LED karıştırılmamalıdır
+- Kart revizyon farkları için hem "LED" hem GP25 desteklenmiştir
+- mpremote, Thonny’ye alternatif olarak stabil dosya yükleme sağlar
+
+
+
+
+==================================================
+EK DÜZELTMELER VE NETLEŞTİRMELER (ÖNEMLİ)
+==================================================
+
+Aşağıdaki maddeler, kurulum sırasında yaşanabilecek
+karışıklıkları ve sahada çıkabilecek sorunları önlemek
+amacıyla README’ye eklenmelidir.
+
+--------------------------------------------------
+A) MicroPython Auto-Run Kuralı (KRİTİK BİLGİ)
+--------------------------------------------------
+
+Raspberry Pi Pico / Pico W üzerinde MicroPython kullanırken:
+
+- YALNIZCA `main.py` dosyası otomatik olarak çalıştırılır.
+- `main_text.py`, `deneme.py`, `led_test.py` gibi dosyalar
+  Pico yeniden başlatıldığında çalışmaz.
+- Çalışmasını istediğimiz kodun adı MUTLAKA `main.py` olmalıdır.
+
+Bu nedenle dosya yüklerken her zaman şu yöntem izlenmelidir:
+
+mpremote connect /dev/ttyACM0 fs cp ~/pico/main.py :main.py
+mpremote connect /dev/ttyACM0 reset
+
+--------------------------------------------------
+B) mpremote Dosya Kopyalama Yolunun Netleştirilmesi
+--------------------------------------------------
+
+README’de geçen:
+
+mpremote connect /dev/ttyACM0 fs cp main.py :main.py
+
+komutu, yalnızca komutun çalıştırıldığı dizinde `main.py`
+dosyası varsa çalışır.
+
+Önerilen ve güvenli kullanım:
+
+mpremote connect /dev/ttyACM0 fs cp ~/pico/main.py :main.py
+
+Bu şekilde dosya yolu açık ve hatasız olur.
+
+--------------------------------------------------
+C) Pi 4 Üzerindeki Komut Gönderme Scripti (pico_cmd.py)
+--------------------------------------------------
+
+Pi 4 üzerinde Pico’ya komut göndermek için aşağıdaki
+dosya oluşturulmalıdır.
+
+Dosya oluşturma:
+
+nano ~/pico/pico_cmd.py
+
+İçerik:
+
+import serial, time, glob
+
+ports = glob.glob("/dev/ttyACM*")
+PORT = ports[0]
+
+ser = serial.Serial(PORT, 115200, timeout=0.2)
+time.sleep(1.5)
+
+print("Connected:", PORT)
+
+def drain(t=1.0):
+    end = time.time() + t
+    while time.time() < end:
+        line = ser.readline()
+        if line:
+            print("PICO>", line.decode(errors="replace").rstrip())
+
+drain(1.5)
+
+for cmd in ["on", "off", "on", "off"]:
+    ser.write((cmd + "\n").encode())
+    ser.flush()
+    drain(1.0)
+    time.sleep(0.2)
+
+Çalıştırma:
+
+python3 ~/pico/pico_cmd.py
+
+--------------------------------------------------
+D) USB Serial Port Seçimi ile İlgili Uyarı
+--------------------------------------------------
+
+Aşağıdaki kod:
+
+ports = glob.glob("/dev/ttyACM*")
+PORT = ports[0]
+
+sistemde TEK bir ACM cihazı varsa sorunsuz çalışır.
+
+Eğer birden fazla USB serial cihaz bağlıysa,
+yanlış porta bağlanma ihtimali vardır.
+
+Bu durumda:
+- Doğru port manuel seçilmeli
+- veya udev kuralı ile sabit bir port adı
+  (/dev/pico_ika gibi) kullanılmalıdır.
+
+--------------------------------------------------
+E) LED Sayısı Kontrolü ve Kart Farkları
+--------------------------------------------------
+
+Pico tarafındaki kod başlangıçta şu çıktıyı verir:
+
+READY led_count= <sayı>
+
+- led_count = 1 veya 2 → onboard LED bulundu ve kontrol ediliyor
+- led_count = 0 → kart üzerinde kontrol edilebilir onboard LED yok
+
+Bu durumda:
+- Kod doğru çalışmaktadır
+- Harici bir LED bağlanması gerekir
+
+--------------------------------------------------
+F) Thonny ve Port Kilitlenmesi (Debug İpucu)
+--------------------------------------------------
+
+Thonny açıkken USB serial port kilitlenebilir.
+Test sırasında Thonny kapalı tutulmalıdır.
+
+Portu hangi programın kullandığını görmek için:
+
+sudo lsof /dev/ttyACM0
+
+komutu kullanılabilir.
+
+--------------------------------------------------
+G) LED Türleri ile İlgili Not
+--------------------------------------------------
+
+Pico üzerindeki POWER LED, kullanıcı tarafından
+kontrol edilemez.
+
+Kontrol edilen LED:
+- "USER LED"
+- veya bazı kartlarda GPIO25 (GP25)
+
+Bu nedenle kodda hem "LED" hem GP25 desteklenmiştir.
+
+==================================================
+

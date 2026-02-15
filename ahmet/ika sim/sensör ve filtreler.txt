@@ -1,0 +1,121 @@
+# Raspberry Pi 4 Tabanlı Sensör Haberleşmesi ve Veri Filtreleme Sistemi
+
+Bu doküman, Raspberry Pi 4 (8 GB RAM) tabanlı bir sistemde kullanılan sensörlerin haberleşme altyapısını ve sensörlerden elde edilen verilerin filtrelenmesi için yapılan teknik araştırmaları kapsamaktadır. 
+Çalışmanın amacı, Linux işletim sistemi üzerinde çalışan Raspberry Pi kullanılarak sensör verilerinin kararlı, güvenilir ve işlenebilir hale getirilmesini sağlamaktır.
+
+## 1. Kullanılan Donanım ve Sensörler
+
+Sistemde aşağıdaki donanım ve sensörler kullanılmaktadır:
+
+- **Ana İşlem Birimi:** Raspberry Pi 4 Model B (8 GB RAM)
+- **IMU Sensörü:** MPU6050  
+  (3 eksen ivmeölçer + 3 eksen jiroskop)
+- **Ultrasonik Mesafe Sensörleri:**  
+  - HC-SR04 ×2
+
+Raspberry Pi’nin yüksek işlem gücü sayesinde tüm sensör verileri yazılımsal olarak işlenmekte, ek bir mikrodenetleyiciye ihtiyaç duyulmamaktadır.
+
+## 2. Sensör ve Raspberry Pi Arası Haberleşme
+
+### 2.1 MPU6050 – I2C Haberleşmesi
+
+MPU6050 sensörü Raspberry Pi’ye I2C protokolü üzerinden bağlanmaktadır. Linux işletim sistemi altında sensör verileri `/dev/i2c-*` arayüzü üzerinden Python tabanlı uygulamalar ile okunmaktadır. 
+İvmeölçer ve jiroskop verileri belirli bir örnekleme frekansında alınmakta ve yazılım seviyesinde zaman damgası eklenmektedir.
+
+### 2.2 HC-SR04 Sensörleri – GPIO Tabanlı Ölçüm
+
+İki adet HC-SR04 ultrasonik sensör, Raspberry Pi GPIO pinleri kullanılarak çalıştırılmaktadır. Her sensör için ayrı TRIG ve ECHO pinleri tanımlanmıştır. 
+Sensörler sıralı (sequential) şekilde tetiklenerek yankı sinyallerinin çakışması engellenmiştir.
+
+Mesafe bilgisi, gönderilen ultrasonik darbenin geri dönüş süresine göre hesaplanmakta ve bu süre yazılım tarafında işlenmektedir.
+
+## 3. Sensör Verilerinde Karşılaşılan Problemler
+
+Yapılan testler sonucunda aşağıdaki problemler gözlemlenmiştir:
+
+- MPU6050 ivme ve jiroskop verilerinde yüksek frekanslı gürültü
+- HC-SR04 sensörlerinde anlık ölçüm sıçramaları
+- Linux işletim sistemi nedeniyle kesin zaman deterministikliğinin olmaması
+
+Bu nedenlerle ham sensör verilerinin doğrudan kullanılmasının uygun olmadığı değerlendirilmiştir.
+
+## 4. İncelenen Veri Filtreleme Yöntemleri
+
+### 4.1 Hareketli Ortalama (Moving Average)
+
+Ultrasonik sensörlerden elde edilen mesafe verilerinde görülen ani sıçramaları bastırmak için hareketli ortalama filtresi incelenmiştir. 
+Belirli sayıda ardışık ölçümün ortalaması alınarak daha kararlı mesafe verisi elde edilmektedir.
+
+### 4.2 Üstel Ağırlıklı Ortalama (EMA)
+
+EMA filtresi, MPU6050 sensöründen alınan ivme ve jiroskop verilerinde tercih edilmiştir. Bu filtre, hem gürültüyü azaltmakta hem de sistemde düşük gecikme oluşturmaktadır. 
+Raspberry Pi üzerinde gerçek zamanlıya yakın şekilde uygulanabilmektedir.
+
+### 4.3 Düşük Geçiren (Low Pass) Filtre
+
+Yüksek frekanslı gürültüyü bastırmak amacıyla dijital Low Pass filtreler değerlendirilmiştir. Özellikle ivmeölçer verilerinde titreşim etkisini azaltmada etkili olduğu gözlemlenmiştir.
+
+### 4.4 Tamamlayıcı Filtre (Complementary Filter)
+
+MPU6050 sensöründe ivmeölçer ve jiroskop verileri birlikte kullanılarak tamamlayıcı filtre uygulanmıştır. Bu yöntemle jiroskobun kısa vadeli hassasiyeti ve ivmeölçerin uzun vadeli kararlılığı birleştirilmiştir.
+
+## 5. Filtreleme Yöntemlerinin Karşılaştırılması ve Seçim Kriterleri
+
+Filtre seçiminde sensör tipi, ölçüm gürültüsü, kabul edilebilir gecikme süresi ve işlemci yükü dikkate alınmıştır.
+
+| Filtre Türü 	 | Gürültü Bastırma | Gecikme 	 | Hesaplama Yükü | Kullanım Alanı 	  |
+|----------------|------------------|------------|----------------|-----------------------|
+| Moving Average | Orta		    | Yüksek     | Çok Düşük 	  | HC-SR04 mesafe ölçümü |
+| EMA 		 | Orta–İyi 	    | Düşük      | Çok Düşük      | MPU6050 ham verileri  |
+| Low Pass 	 | İyi 		    | Düşük–Orta | Düşük          | İvmeölçer 		  |
+| Complementary  | İyi 		    | Çok Düşük  | Düşük          | Açı / hareket         |
+
+Bu karşılaştırma sonucunda EMA ve Low Pass filtrelerin temel filtreleme katmanı olarak kullanılmasının uygun olduğu değerlendirilmiştir.
+
+## 6. Sensör Bazlı Filtreleme Stratejisi
+
+- **MPU6050 – İvmeölçer:** EMA + Low Pass  
+- **MPU6050 – Jiroskop:** EMA + Tamamlayıcı filtre  
+- **HC-SR04 (2 adet):** Moving Average
+
+Bu yapı, işlemci yükünü artırmadan yeterli veri kararlılığı sağlamaktadır.
+
+## 7. Sensör Füzyonu Yaklaşımı
+
+İvmeölçer ve jiroskop verileri tamamlayıcı filtre ile birleştirilerek daha güvenilir açı ve hareket bilgisi elde edilmiştir. 
+Kalman filtresi, hesaplama maliyeti nedeniyle bu proje kapsamında ileri seviye geliştirme aşamasına bırakılmıştır.
+
+## 8. Veri Akış ve İşleme Mimarisi
+
+Sistemde önerilen veri akışı aşağıdaki gibidir:
+
+Sensör → I2C / GPIO Okuma → Zaman Damgası → Ham Veri → Filtreleme → İşlenmiş Veri → Kayıt / Görselleştirme / Kontrol
+
+Bu mimari ile sensör verileri kararlı ve izlenebilir hale getirilmiştir.
+
+## 9. Sonuç
+
+Raspberry Pi 4 tabanlı bu sistemde MPU6050 ve iki adet HC-SR04 sensöründen elde edilen ham verilerin filtrelenmeden kullanılmasının uygun olmadığı görülmüştür. 
+Uygulanan filtreleme yöntemleri sayesinde gürültü azaltılmış, ölçüm kararlılığı artırılmış ve sistem gerçek kullanım senaryolarına uygun hale getirilmiştir.
+
+## Örnek Kodlar ve GitHub Referansları
+
+Bu çalışmada kullanılan filtreleme yöntemleri ve sensör okuma yaklaşımları için aşağıdaki açık kaynak projeler incelenmiştir:
+
+- **IMU Veri Filtreleme (Moving Average, Low Pass, Kalman)**  
+  https://github.com/keatinl1/Filter_IMU
+
+- **MPU6050 için Complementary Filter ve Sensör Füzyonu**  
+  https://github.com/MarkSherstan/MPU-6050-9250-I2C-CompFilter
+
+- **MPU6050 Python Kalman Filter Uygulaması**  
+  https://github.com/rocheparadox/Kalman-Filter-Python-for-mpu6050
+
+- **Raspberry Pi üzerinde MPU6050 Ham Veri Okuma (Python)**  
+  https://github.com/m-rtijn/mpu6050
+
+- **Python ile Moving Average Filtre Örnekleri**  
+  https://github.com/motorrr4ik/moving_average_filters
+
+- **Raspberry Pi + HC-SR04 Ultrasonik Mesafe Ölçümü**  
+  https://github.com/rm-hull/hcsr04

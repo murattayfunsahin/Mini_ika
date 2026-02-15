@@ -1,0 +1,215 @@
+cat > ~/ika/src/vision_brain.py <<'PY'
+import json
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+
+# --- OCR (ADDED) ---
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+HOME = Path.home()
+CONFIG_PATH = HOME / "ika" / "config" / "vision_config.json"
+
+def load_config():
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    if "log_path" in cfg:
+        cfg["log_path"] = str(Path(cfg["log_path"]).expanduser())
+    return cfg
+
+def init_camera():
+    cam = Picamera2()
+    cfg = cam.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+    cam.configure(cfg)
+    cam.start()
+    return cam
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+# --- OCR HELPERS (ADDED) ---
+def preprocess_for_ocr(rgb_img, cfg):
+    """
+    OCR için görüntüyü sadeleştirir: grayscale + threshold + (opsiyonel) blur.
+    Yapıyı bozmadan ayrı fonksiyon olarak eklendi.
+    """
+    gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
+
+    if cfg.get("ocr_blur", 1) > 0:
+        k = int(cfg.get("ocr_blur", 1))
+        if k % 2 == 0:
+            k += 1
+        gray = cv2.GaussianBlur(gray, (k, k), 0)
+
+    thr = int(cfg.get("ocr_threshold", 170))
+    _, bw = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
+
+    return bw
+
+def run_ocr_on_image(rgb_img, cfg):
+    """
+    OCR çalıştırır ve text döndürür.
+    pytesseract yoksa boş döner.
+    """
+    if not cfg.get("ocr_enable", False):
+        return ""
+
+    if pytesseract is None:
+        return ""
+
+    bw = preprocess_for_ocr(rgb_img, cfg)
+
+    lang = cfg.get("ocr_lang", "eng")
+    psm = int(cfg.get("ocr_psm", 6))
+    oem = int(cfg.get("ocr_oem", 3))
+    tess_cfg = f"--oem {oem} --psm {psm}"
+
+    text = pytesseract.image_to_string(bw, lang=lang, config=tess_cfg)
+    text = (text or "").strip()
+    text = " ".join(text.split())  # tek satır yap
+    return text
+
+def process_frame_to_command(frame, cfg):
+    h, w, _ = frame.shape
+    y0 = int(h * cfg.get("roi_y", 0.55))
+    roi = frame[y0:, :]
+
+    # HSV mask (white-ish / low saturation + high value)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+
+    v_min = int(cfg.get("v_min", 180))
+    s_max = int(cfg.get("s_max", 70))
+    lower = np.array([0, 0, v_min], dtype=np.uint8)
+    upper = np.array([180, s_max, 255], dtype=np.uint8)
+
+    bw = cv2.inRange(hsv, lower, upper)
+
+    # Clean mask (reduce noise)
+    k = int(cfg.get("morph_k", 5))
+    if k < 1: k = 1
+    kernel = np.ones((k, k), np.uint8)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    M = cv2.moments(bw)
+    area_px = M["m00"] / 255.0  # pixel count (approx)
+    min_area = float(cfg.get("min_area_px", 5000))
+
+    if area_px < min_area:
+        return 0.0, 0.0, 0.0, {"y0": y0, "cx": None, "bw": bw, "roi": roi}
+
+    cx = int(M["m10"] / M["m00"])
+    steer = (cx - (w / 2)) / (w / 2)
+    steer = clamp(steer, -1.0, 1.0)
+
+    # Confidence based on area
+    conf = clamp(area_px / float(cfg.get("conf_area_norm", 20000)), 0.0, 1.0)
+
+    throttle = 0.2 + 0.6 * conf
+    throttle = clamp(throttle, 0.0, 1.0)
+
+    return throttle, steer, conf, {"y0": y0, "cx": cx, "bw": bw, "roi": roi}
+
+def main():
+    cfg = load_config()
+    fps = int(cfg.get("fps", 20))
+    dt = 1.0 / max(1, fps)
+
+    alpha = float(cfg.get("ema_alpha", 0.25))
+    conf_stop_frames = int(cfg.get("conf_stop_frames", 8))
+    thr_min = float(cfg.get("throttle_min", 0.15))
+    thr_max = float(cfg.get("throttle_max", 0.80))
+
+    log_path = Path(cfg.get("log_path", str(HOME / "ika" / "logs" / "vision.log"))).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cam = init_camera()
+    print("[OK] Vision Brain started")
+
+    steer_ema = 0.0
+    lost_cnt = 0
+
+    # --- OCR state (ADDED) ---
+    frame_i = 0
+    last_ocr_text = ""
+
+    with log_path.open("a", encoding="utf-8") as logf:
+        while True:
+            t0 = time.time()
+            frame_i += 1
+
+            frame = cam.capture_array()
+            throttle, steer, conf, dbg = process_frame_to_command(frame, cfg)
+
+            if conf <= 0.01:
+                lost_cnt += 1
+            else:
+                lost_cnt = 0
+
+            if lost_cnt >= conf_stop_frames:
+                throttle = 0.0
+                steer = 0.0
+                conf = 0.0
+
+            steer_ema = (1.0 - alpha) * steer_ema + alpha * steer
+            steer_ema = clamp(steer_ema, -1.0, 1.0)
+
+            if throttle > 0.0:
+                throttle = clamp(throttle, thr_min, thr_max)
+
+            line = f"V,{throttle:.3f},{steer_ema:.3f},{conf:.3f}"
+            print(line)
+            logf.write(line + "\n")
+            logf.flush()
+
+            # --- OCR (ADDED): every N frames, log as separate line ---
+            if cfg.get("ocr_enable", False) and (frame_i % int(cfg.get("ocr_every_n", 20)) == 0):
+                # OCR için ROI kullanıyoruz (istersen frame'in tamamına da çevirebiliriz)
+                ocr_src = dbg.get("roi", frame)
+                text = run_ocr_on_image(ocr_src, cfg)
+
+                # boşsa loglama; varsa ve değiştiyse yaz
+                if text and text != last_ocr_text:
+                    last_ocr_text = text
+                    oline = f"O,{text}"
+                    print(oline)
+                    logf.write(oline + "\n")
+                    logf.flush()
+
+            if cfg.get("debug_preview", False):
+                vis = frame.copy()
+                y0 = dbg["y0"]
+                cv2.line(vis, (0, y0), (vis.shape[1] - 1, y0), (0, 255, 0), 2)
+                if dbg["cx"] is not None:
+                    cx = dbg["cx"]
+                    cv2.line(vis, (cx, y0), (cx, vis.shape[0] - 1), (255, 0, 0), 2)
+
+                txt = f"thr={throttle:.2f} steer={steer_ema:.2f} conf={conf:.2f} lost={lost_cnt}"
+                cv2.putText(vis, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                # OCR debug text (ADDED)
+                if cfg.get("ocr_enable", False) and last_ocr_text:
+                    cv2.putText(vis, f"OCR: {last_ocr_text[:40]}", (10, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                cv2.imshow("Vision Debug", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+                # show mask too
+                cv2.imshow("Mask", dbg["bw"])
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            elapsed = time.time() - t0
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+
+if __name__ == "__main__":
+    main()
+PY

@@ -1,0 +1,395 @@
+# -*- coding: utf-8 -*-
+"""
+TEMIRBUG PRO - Lane/Wall Following with PID + Dynamic ROI + HUD
+Raspberry Pi Camera Module 3 READY (libcamera -> GStreamer -> OpenCV)
+
+REQUIREMENTS (Raspberry Pi OS):
+  sudo apt update
+  sudo apt install -y libcamera-apps gstreamer1.0-tools \
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+      python3-opencv
+
+TEST CAMERA:
+  libcamera-hello
+"""
+
+import cv2
+import numpy as np
+import serial
+import time
+import threading
+from collections import deque
+
+# ==============================================================================
+#  PID CONTROLLER
+# ==============================================================================
+class PIDController:
+    def __init__(self, Kp: float, Ki: float, Kd: float):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.prev_error = 0.0
+        self.integral = 0.0
+
+    def compute(self, error: float) -> int:
+        P = error
+
+        self.integral += error
+        if self.integral > 1000:
+            self.integral = 1000
+        if self.integral < -1000:
+            self.integral = -1000
+
+        derivative = error - self.prev_error
+        self.prev_error = error
+
+        output = (self.Kp * P) + (self.Ki * self.integral) + (self.Kd * derivative)
+        return int(output)
+
+# ==============================================================================
+#  CONFIG
+# ==============================================================================
+class Config:
+    FRAME_WIDTH = 640
+    FRAME_HEIGHT = 480
+    FPS = 30
+
+    # PID (tune these)
+    PID_KP = 0.55
+    PID_KI = 0.00
+    PID_KD = 0.35
+
+    # Speed
+    BASE_SPEED = 30
+    MAX_STEER = 100  # clamp output to [-100, 100]
+
+    # Lane width memory (pixels)
+    LANE_WIDTH = 380
+
+    # Hough parameters (tune if needed)
+    HOUGH_RHO = 2
+    HOUGH_THETA = np.pi / 180
+    HOUGH_THRESHOLD = 50
+    HOUGH_MIN_LINE_LEN = 30
+    HOUGH_MAX_LINE_GAP = 100
+
+    # Pi Camera Module 3 via libcamera + GStreamer
+    # If this pipeline fails, code falls back to /dev/video0 (index 0).
+    GST_PIPELINE = (
+        "libcamerasrc ! "
+        f"video/x-raw,width={FRAME_WIDTH},height={FRAME_HEIGHT},framerate={FPS}/1 ! "
+        "videoconvert ! "
+        "appsink drop=true max-buffers=1 sync=false"
+    )
+
+# ==============================================================================
+#  SERIAL (PICO COMM)
+# ==============================================================================
+def open_serial(port="/dev/ttyACM0", baud=115200):
+    try:
+        s = serial.Serial(port, baud, timeout=1)
+        s.flush()
+        print("PICO CONNECTED - SYSTEM ONLINE")
+        return s
+    except Exception:
+        print("PICO NOT FOUND - SIMULATION MODE")
+        return None
+
+ser = open_serial()
+
+def send_command(speed: int, steer: int):
+    """
+    Sends: <speed,steer>\n
+    steer is clamped to [-MAX_STEER, MAX_STEER]
+    """
+    if not ser:
+        return
+    try:
+        steer = max(min(int(steer), Config.MAX_STEER), -Config.MAX_STEER)
+        speed = int(speed)
+        msg = f"<{speed},{steer}>\n"
+        ser.write(msg.encode("ascii", errors="ignore"))
+    except:
+        pass
+
+# ==============================================================================
+#  MULTI-THREADED CAMERA (Pi Camera Module 3 READY)
+# ==============================================================================
+class VideoStream:
+    def __init__(self, width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.stopped = False
+
+        self.stream = self._open_picamera_gstreamer()
+        if self.stream is None or not self.stream.isOpened():
+            # Fallback to /dev/video0 (USB webcam or V4L2 bridge)
+            print("GStreamer PiCam pipeline failed. Falling back to VideoCapture(0).")
+            self.stream = cv2.VideoCapture(0)
+            self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self.stream.set(cv2.CAP_PROP_FPS, fps)
+
+        (self.grabbed, self.frame) = self.stream.read()
+        if not self.grabbed:
+            print("WARNING: Could not read initial frame from camera.")
+
+    def _open_picamera_gstreamer(self):
+        # Use CAP_GSTREAMER to pull frames from libcamera via GStreamer
+        try:
+            cap = cv2.VideoCapture(Config.GST_PIPELINE, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                print("Pi Camera Module 3 opened via libcamera (GStreamer).")
+                return cap
+            return None
+        except Exception:
+            return None
+
+    def start(self):
+        threading.Thread(target=self.update, args=(), daemon=True).start()
+        return self
+
+    def update(self):
+        while True:
+            if self.stopped:
+                return
+            grabbed, frame = self.stream.read()
+            if grabbed:
+                self.grabbed = grabbed
+                self.frame = frame
+
+    def read(self):
+        return self.frame
+
+    def stop(self):
+        self.stopped = True
+        try:
+            self.stream.release()
+        except:
+            pass
+
+# ==============================================================================
+#  IMAGE PROCESSING + DYNAMIC ROI
+# ==============================================================================
+def preprocess_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    return edges
+
+def dynamic_roi(edges, steering_bias):
+    """
+    Shifts ROI trapezoid in the direction of the previous steering output.
+    steering_bias: negative => left, positive => right
+    """
+    height, width = edges.shape[:2]
+    shift = int(steering_bias * 0.8)
+
+    top_left_x = int(width * 0.1) + shift
+    top_right_x = int(width * 0.9) + shift
+
+    top_left_x = max(0, min(width, top_left_x))
+    top_right_x = max(0, min(width, top_right_x))
+
+    poly = np.array([[
+        (0, height),
+        (width, height),
+        (top_right_x, int(height * 0.5)),
+        (top_left_x, int(height * 0.5)),
+    ]], dtype=np.int32)
+
+    mask = np.zeros_like(edges)
+    cv2.fillPoly(mask, poly, 255)
+    roi_edges = cv2.bitwise_and(edges, mask)
+    return roi_edges, poly
+
+# ==============================================================================
+#  LANE LINE ESTIMATION (HOUGH -> AVG SLOPE/INTERCEPT)
+# ==============================================================================
+def get_lane_lines(lines, prev_width):
+    left_lines, right_lines = [], []
+    if lines is None:
+        return None, None, prev_width
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x1 == x2:
+            continue
+
+        slope, intercept = np.polyfit((x1, x2), (y1, y2), 1)
+
+        # Filter out near-horizontal and extremely steep lines
+        if abs(slope) < 0.3 or abs(slope) > 3.0:
+            continue
+
+        if slope < 0:
+            left_lines.append((slope, intercept))
+        else:
+            right_lines.append((slope, intercept))
+
+    left_lane = np.average(left_lines, axis=0) if left_lines else None
+    right_lane = np.average(right_lines, axis=0) if right_lines else None
+    return left_lane, right_lane, prev_width
+
+def make_coords(image, line_params):
+    if line_params is None:
+        return None
+    slope, intercept = line_params
+    y1 = image.shape[0]
+    y2 = int(y1 * 0.65)
+    if slope == 0:
+        slope = 1e-6
+    x1 = int((y1 - intercept) / slope)
+    x2 = int((y2 - intercept) / slope)
+    return ((x1, y1), (x2, y2))
+
+# ==============================================================================
+#  HUD / DASHBOARD
+# ==============================================================================
+def draw_dashboard(image, pid_out, fps, roi_poly):
+    h, w = image.shape[:2]
+
+    if roi_poly is not None:
+        cv2.polylines(image, [roi_poly], True, (255, 100, 0), 2)
+
+    cv2.rectangle(image, (0, 0), (w, 60), (0, 0, 0), -1)
+
+    cv2.putText(image, f"FPS: {int(fps)}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    cv2.rectangle(image, (w // 2 - 100, 20), (w // 2 + 100, 40), (100, 100, 100), -1)
+
+    pid_vis = max(min(int(pid_out), 100), -100)
+    bar_width = int(pid_vis)
+    color = (0, 255, 0) if abs(pid_vis) < 30 else (0, 0, 255)
+
+    if bar_width >= 0:
+        cv2.rectangle(image, (w // 2, 20), (w // 2 + bar_width, 40), color, -1)
+    else:
+        cv2.rectangle(image, (w // 2 + bar_width, 20), (w // 2, 40), color, -1)
+
+    cv2.line(image, (w // 2, 15), (w // 2, 45), (255, 255, 255), 2)
+
+    cv2.putText(image, f"PID: {pid_vis}", (w // 2 - 40, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    return image
+
+# ==============================================================================
+#  MAIN LOOP
+# ==============================================================================
+def main():
+    vs = VideoStream(width=Config.FRAME_WIDTH, height=Config.FRAME_HEIGHT, fps=Config.FPS).start()
+    time.sleep(1.0)  # camera warm-up
+
+    pid = PIDController(Config.PID_KP, Config.PID_KI, Config.PID_KD)
+
+    error_buffer = deque(maxlen=5)
+    fps_start = time.time()
+    frame_count = 0
+    fps = 0
+
+    avg_width = Config.LANE_WIDTH
+    last_steer = 0
+
+    print("--- TEMIRBUG PRO SYSTEM STARTED ---")
+
+    try:
+        while True:
+            frame = vs.read()
+            if frame is None:
+                break
+
+            frame_count += 1
+            if time.time() - fps_start > 1:
+                fps = frame_count
+                frame_count = 0
+                fps_start = time.time()
+
+            edges = preprocess_image(frame)
+
+            roi_edges, roi_poly = dynamic_roi(edges, last_steer)
+
+            lines = cv2.HoughLinesP(
+                roi_edges,
+                Config.HOUGH_RHO,
+                Config.HOUGH_THETA,
+                Config.HOUGH_THRESHOLD,
+                np.array([]),
+                minLineLength=Config.HOUGH_MIN_LINE_LEN,
+                maxLineGap=Config.HOUGH_MAX_LINE_GAP
+            )
+
+            left_p, right_p, avg_width = get_lane_lines(lines, avg_width)
+
+            center_x = Config.FRAME_WIDTH // 2
+            lane_center = None
+
+            l_coords = make_coords(frame, left_p)
+            r_coords = make_coords(frame, right_p)
+
+            final_view = frame.copy()
+
+            if l_coords and r_coords:
+                lane_center = int((l_coords[1][0] + r_coords[1][0]) / 2)
+
+                current_w = r_coords[1][0] - l_coords[1][0]
+                avg_width = int(avg_width * 0.95 + current_w * 0.05)
+
+                cv2.line(final_view, l_coords[0], l_coords[1], (0, 255, 0), 5)
+                cv2.line(final_view, r_coords[0], r_coords[1], (0, 255, 0), 5)
+
+            elif l_coords:
+                lane_center = int(l_coords[1][0] + (avg_width / 2))
+                cv2.line(final_view, l_coords[0], l_coords[1], (0, 255, 255), 5)
+
+            elif r_coords:
+                lane_center = int(r_coords[1][0] - (avg_width / 2))
+                cv2.line(final_view, r_coords[0], r_coords[1], (0, 255, 255), 5)
+
+            if lane_center is not None:
+                raw_error = lane_center - center_x
+
+                error_buffer.append(raw_error)
+                smooth_error = sum(error_buffer) / len(error_buffer)
+
+                pid_output = pid.compute(smooth_error)
+                last_steer = pid_output
+
+                if abs(pid_output) > 30:
+                    current_speed = Config.BASE_SPEED - 5
+                else:
+                    current_speed = Config.BASE_SPEED
+
+                send_command(current_speed, pid_output)
+
+                cv2.circle(final_view, (lane_center, int(Config.FRAME_HEIGHT * 0.65)),
+                           10, (0, 0, 255), -1)
+                draw_dashboard(final_view, pid_output, fps, roi_poly)
+
+            else:
+                cv2.putText(final_view, "LOST!", (280, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 5)
+
+            cv2.imshow("TEMIRBUG PRO HUD", final_view)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                send_command(0, 0)
+                break
+
+    except KeyboardInterrupt:
+        send_command(0, 0)
+
+    finally:
+        vs.stop()
+        cv2.destroyAllWindows()
+        if ser:
+            try:
+                ser.close()
+            except:
+                pass
+
+if __name__ == "__main__":
+    main()

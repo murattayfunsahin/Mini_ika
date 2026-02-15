@@ -1,0 +1,207 @@
+cp ~/ika/config/vision_config.json ~/ika/config/vision_config.json.bak 2>/dev/null || true
+
+cat > ~/ika/config/vision_config.json <<'JSON'
+{
+  "fps": 20,
+  "log_path": "~/ika/logs/vision.log",
+  "debug_preview": true,
+
+  "ema_alpha": 0.25,
+  "conf_stop_frames": 8,
+  "throttle_min": 0.12,
+  "throttle_max": 0.80,
+
+  "roi_y": 0.55,
+  "band_h": 0.22,
+
+  "v_min": 185,
+  "s_max": 65,
+  "morph_k": 5,
+  "min_area_px": 2500,
+  "conf_area_norm": 15000,
+
+  "steer_slow_k": 0.6,
+
+  "save_frames": true,
+  "frames_dir": "~/ika/logs/frames",
+  "save_every_n": 20
+}
+JSON
+
+
+
+
+
+
+
+
+cat > ~/ika/src/vision_brain.py <<'PY'
+import json
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+
+HOME = Path.home()
+CONFIG_PATH = HOME / "ika" / "config" / "vision_config.json"
+
+def load_config():
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    for k in ["log_path", "frames_dir"]:
+        if k in cfg and isinstance(cfg[k], str):
+            cfg[k] = str(Path(cfg[k]).expanduser())
+    return cfg
+
+def init_camera():
+    cam = Picamera2()
+    cfg = cam.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+    cam.configure(cfg)
+    cam.start()
+    return cam
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def biggest_component_centroid(bw):
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    if num <= 1:
+        return None, 0.0
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    idx = int(np.argmax(areas)) + 1
+    area = float(stats[idx, cv2.CC_STAT_AREA])
+    cx, cy = centroids[idx]
+    return int(cx), area
+
+def process_frame_to_command(frame, cfg):
+    h, w, _ = frame.shape
+    y0 = int(h * cfg.get("roi_y", 0.55))
+    roi = frame[y0:, :]
+
+    band_h = float(cfg.get("band_h", 0.22))
+    bh = int(roi.shape[0] * band_h)
+    bh = max(10, min(bh, roi.shape[0]))
+    band = roi[-bh:, :]
+
+    hsv = cv2.cvtColor(band, cv2.COLOR_RGB2HSV)
+    v_min = int(cfg.get("v_min", 185))
+    s_max = int(cfg.get("s_max", 65))
+    lower = np.array([0, 0, v_min], dtype=np.uint8)
+    upper = np.array([180, s_max, 255], dtype=np.uint8)
+    bw = cv2.inRange(hsv, lower, upper)
+
+    k = int(cfg.get("morph_k", 5))
+    k = max(1, k)
+    kernel = np.ones((k, k), np.uint8)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    cx, area_px = biggest_component_centroid(bw)
+    min_area = float(cfg.get("min_area_px", 2500))
+    if cx is None or area_px < min_area:
+        return 0.0, 0.0, 0.0, {"y0": y0, "cx": None, "bw": bw, "band_top": y0 + (roi.shape[0] - bh)}
+
+    steer = (cx - (w / 2)) / (w / 2)
+    steer = clamp(steer, -1.0, 1.0)
+
+    conf = clamp(area_px / float(cfg.get("conf_area_norm", 15000)), 0.0, 1.0)
+
+    throttle = 0.2 + 0.6 * conf
+    throttle = clamp(throttle, 0.0, 1.0)
+
+    return throttle, steer, conf, {"y0": y0, "cx": cx, "bw": bw, "band_top": y0 + (roi.shape[0] - bh)}
+
+def main():
+    cfg = load_config()
+    fps = int(cfg.get("fps", 20))
+    dt = 1.0 / max(1, fps)
+
+    alpha = float(cfg.get("ema_alpha", 0.25))
+    conf_stop_frames = int(cfg.get("conf_stop_frames", 8))
+    thr_min = float(cfg.get("throttle_min", 0.12))
+    thr_max = float(cfg.get("throttle_max", 0.80))
+    steer_slow_k = float(cfg.get("steer_slow_k", 0.6))
+
+    log_path = Path(cfg.get("log_path", str(HOME / "ika" / "logs" / "vision.log"))).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    save_frames = bool(cfg.get("save_frames", False))
+    frames_dir = Path(cfg.get("frames_dir", str(HOME / "ika" / "logs" / "frames"))).expanduser()
+    save_every_n = int(cfg.get("save_every_n", 20))
+    if save_frames:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+    cam = init_camera()
+    print("[OK] Vision Brain started")
+
+    steer_ema = 0.0
+    lost_cnt = 0
+    frame_i = 0
+
+    with log_path.open("a", encoding="utf-8") as logf:
+        while True:
+            t0 = time.time()
+            frame_i += 1
+
+            frame = cam.capture_array()
+            throttle, steer, conf, dbg = process_frame_to_command(frame, cfg)
+
+            if conf <= 0.01:
+                lost_cnt += 1
+            else:
+                lost_cnt = 0
+
+            if lost_cnt >= conf_stop_frames:
+                throttle = 0.0
+                steer = 0.0
+                conf = 0.0
+
+            steer_ema = (1.0 - alpha) * steer_ema + alpha * steer
+            steer_ema = clamp(steer_ema, -1.0, 1.0)
+
+            throttle = throttle * (1.0 - steer_slow_k * abs(steer_ema))
+            if throttle > 0.0:
+                throttle = clamp(throttle, thr_min, thr_max)
+
+            line = f"V,{throttle:.3f},{steer_ema:.3f},{conf:.3f}"
+            print(line)
+            logf.write(line + "\n")
+            logf.flush()
+
+            # --- SAVE CAMERA FRAMES + MASK ---
+            if save_frames and (frame_i % max(1, save_every_n) == 0):
+                ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+                img_path = frames_dir / f"frame_{ts}_{frame_i:06d}.jpg"
+                msk_path = frames_dir / f"mask_{ts}_{frame_i:06d}.png"
+                cv2.imwrite(str(img_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(str(msk_path), dbg["bw"])
+
+            if cfg.get("debug_preview", False):
+                vis = frame.copy()
+                y0 = dbg["y0"]
+                cv2.line(vis, (0, y0), (vis.shape[1] - 1, y0), (0, 255, 0), 2)
+
+                band_top = dbg.get("band_top", y0)
+                cv2.line(vis, (0, band_top), (vis.shape[1] - 1, band_top), (0, 200, 255), 2)
+
+                if dbg["cx"] is not None:
+                    cx = dbg["cx"]
+                    cv2.line(vis, (cx, y0), (cx, vis.shape[0] - 1), (255, 0, 0), 2)
+
+                txt = f"thr={throttle:.2f} steer={steer_ema:.2f} conf={conf:.2f} lost={lost_cnt}"
+                cv2.putText(vis, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                cv2.imshow("Vision Debug", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+                cv2.imshow("Mask", dbg["bw"])
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            elapsed = time.time() - t0
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+
+if __name__ == "__main__":
+    main()
+PY
