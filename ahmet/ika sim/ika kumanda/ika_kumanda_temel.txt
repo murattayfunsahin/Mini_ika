@@ -1,0 +1,202 @@
+# İKA Kumanda + Kontrol Mimarisi (Şemaya Göre) — Açıklama Dokümanı (TEK BLOK)
+
+Bu doküman, paylaşılan bağlantı şemasına göre İKA’nın sürüş mantığını,
+kumanda seçimini, Pico’nun rolünü ve motor/servo kontrol prensiplerini
+netleştirmek için hazırlanmıştır.
+
+==================================================
+1) SÜRÜŞ MODELİ (BİZİM SİSTEM NE?)
+==================================================
+
+Sistemde:
+- 4 adet DC motor: İleri / geri itki üretir (hız kontrolü)
+- 2 adet servo: Yönlendirme (sağa/sola dönme) sağlar (direksiyon)
+
+Bu yapı "tank drive" değildir.
+Yani sağ/sol motorları farklı hızla çevirerek dönmek yerine,
+dönüş servo ile yapılır.
+
+Özet:
+- Throttle (gaz) => DC motorlar
+- Steer (direksiyon) => Servolar
+
+==================================================
+2) SERVO MOTORLAR "MOTOR SÜRÜCÜYE" BAĞLANMAZ (KRİTİK)
+==================================================
+
+Klasik servo motorlar (SG90/MG995 vb.) motor sürücüler (H-bridge) ile
+sürülmez.
+
+Servo motor kontrolü:
+- 50Hz PWM sinyali ister (servo pulse)
+- Tipik pulse aralığı: 1000–2000 mikro saniye (us)
+- Sinyali Pico’nun GPIO PWM pininden verilir
+- Servo beslemesi genellikle 5–6V ayrı hat olmalıdır (akım yüksek)
+
+DC motor sürücü ise:
+- PWM + yön (DIR) / veya IN1-IN2 gibi girişlerle sürülür
+- Yüksek akım çeker; motor bataryasından beslenir
+
+Bu nedenle doğru bağlantı prensibi:
+- 4 DC motor -> motor sürücüler
+- 2 servo -> Pico PWM GPIO (besleme ayrı, GND ortak)
+
+==================================================
+3) ŞEMADAKİ GÜÇ MİMARİSİ (NEDEN BÖYLE?)
+==================================================
+
+Şemada iki batarya görünmektedir:
+- 11.1V (3S) 2200mAh -> DC motorlar ve motor sürücüler
+- 7.4V (2S) 3000mAh -> Pico + servo hattı (regülatör üzerinden)
+
+Bu yaklaşımın amacı:
+- Motorların yarattığı gürültünün (noise) kontrol elektroniğine
+  etkisini azaltmak
+- Servo ve kontrol biriminin daha stabil beslenmesi
+- Yüksek akım (motor) ile düşük akım (logic) hattını ayırmak
+
+ÖNEMLİ:
+- Tüm sistemde GND ortak olmalıdır (şemada bu doğru görünüyor).
+  Ortak GND yoksa PWM ve sinyaller referans bulamaz.
+
+==================================================
+4) MOTOR SÜRÜCÜ TİPİ (RPWM/LPWM ÜZERİNDEN)
+==================================================
+
+Şemadaki sürücülerde:
+- RPWM / LPWM
+- R_EN / L_EN
+pin isimleri görülüyor.
+
+Bu isimlendirme genelde BTS7960 benzeri sürücülerde kullanılır.
+
+Çalışma mantığı:
+- İleri: RPWM = PWM, LPWM = 0
+- Geri:  RPWM = 0,   LPWM = PWM
+- Dur:   RPWM = 0,   LPWM = 0
+Enable hatları (R_EN / L_EN) aktif edilerek sürücü açılır.
+
+==================================================
+5) 4 DC MOTOR NASIL KONTROL EDİLECEK?
+==================================================
+
+Bu sistemde DC motorların görevi:
+- İleri / geri hız üretmek (throttle)
+
+En basit ve doğru sürüş:
+- 4 motorun hepsine aynı throttle uygulanır
+
+Örnek:
+- throttle > 0  => tüm motorlar ileri PWM
+- throttle < 0  => tüm motorlar geri PWM
+- throttle = 0  => tüm motorlar stop
+
+İleride istenirse (opsiyonel):
+- dönüşlerde stabilite için iç/arka motor hızına küçük düzeltmeler
+  (assist) eklenebilir; ancak temel sistem için şart değildir.
+
+==================================================
+6) 2 SERVO İLE DİREKSİYON (SAĞ/SOL SERVO)
+==================================================
+
+2 servo genellikle sağ ve sol taraftaki direksiyon mekanizmasını sürer.
+
+Direksiyon komutu:
+- steer ∈ [-1000, +1000] (normalize edilmiş düşün)
+
+Servo eşlemesi (ayna mantığı):
+- servo_left  = center + k*steer + trim_L
+- servo_right = center - k*steer + trim_R
+
+Neden trim var?
+- Mekanik montaj farkları (kol boyu, açı, dişli konumu)
+- Sağ/sol tekerlerin tam düz konumunu yakalamak
+
+Servo limitleri mutlaka clamp edilmelidir:
+- min_pulse <= pulse <= max_pulse
+
+==================================================
+7) KUMANDA SEÇİMİ (NEDEN RC KUMANDA ÖNERİLDİ?)
+==================================================
+
+Bu sürüş modelinde servo direksiyon vardır.
+Servo direksiyonda gecikme çok kritiktir.
+
+Bu nedenle ilk aşama için en güvenilir seçenek:
+- Hazır RC kumanda + alıcı (2.4GHz)
+
+Artıları:
+- Çok düşük gecikme
+- Saha şartlarında stabil RF bağlantı
+- Alıcının failsafe özelliği ile sinyal kaybında otomatik güvenlik
+- Debug yükünü azaltır (Wi-Fi/BLE sorunlarıyla uğraşılmaz)
+
+Custom kumanda (Pico W / ESP32) yapılabilir ama:
+- RF/latency/kopma riskini sizin yönetmeniz gerekir
+- İlk çalışan sürümü geciktirir
+
+Önerilen yaklaşım:
+1) Önce RC kumanda ile sistem yürüsün (yarışa hazır)
+2) Sonra istenirse custom kumanda ikinci iterasyon olarak yapılır
+
+==================================================
+8) KUMANDA KANAL EŞLEMESİ (ÖNERİ)
+==================================================
+
+Örnek 6 kanal senaryo:
+
+- CH1: Steer (direksiyon)
+- CH2: Throttle (gaz)
+- CH3: ARM / DISARM
+- CH4: MODE (MANUAL / ASSIST / AUTO)
+- CH5: E-STOP (acil durdurma)
+- CH6: Opsiyon (kamera, hız limiti vs.)
+
+Alıcı -> Pico bağlantısı iki şekilde yapılabilir:
+- PWM kanal kanal (basit)
+- iBUS / SBUS (tek seri hat, daha temiz)
+
+==================================================
+9) PICO KONTROL MİMARİSİ (EN ÖNEMLİ KISIM)
+==================================================
+
+Pico araç üzerinde "tek otorite" olmalıdır.
+Yani motor/servo sinyali nihai olarak Pico tarafından üretilmelidir.
+
+Pico iki kaynaktan komut alabilir:
+- Manuel: RC alıcı
+- Otonom: Pi 4 (vision/algoritma)
+
+Pico her zaman güvenlik kurallarını uygular.
+
+Öncelik sırası (hard rule):
+1) E-STOP aktifse:
+   - motor PWM = 0
+   - servo = center
+2) ARM yoksa:
+   - motor PWM = 0
+   - servo = center (veya son konum)
+3) Deadman yoksa (basılı tutma yoksa):
+   - motor PWM = 0
+   - servo center
+4) MODE:
+   - MANUAL: RC komutu kullan
+   - ASSIST: RC + limit/engel önleme
+   - AUTO: Pi komutu kullan (RC override her zaman açık olabilir)
+
+Failsafe prensibi:
+- Komut gelmezse belirli süre sonra STOP (ör: 300ms)
+
+==================================================
+10) ÖZET
+==================================================
+
+- Sistem: Servo direksiyon + DC itki (araba gibi)
+- Servo motorlar motor sürücüye değil Pico PWM çıkışlarına bağlanır
+- DC motorlar RPWM/LPWM ile sürücü üzerinden sürülür
+- 4 motor aynı throttle ile kontrol edilir
+- 2 servo steer ile ayna mantığıyla kontrol edilir (trim gerekli)
+- İlk sürüm için en güvenilir kumanda: Hazır RC kumanda + alıcı
+- Pico: güvenlik + mod geçiş + motor/servo üretimi yapan merkez birimdir
+
+Bu açıklamalar, İKA kumanda tasarımının temelini oluşturur.

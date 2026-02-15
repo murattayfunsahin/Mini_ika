@@ -1,0 +1,4048 @@
+==================================================
+İKA PC (WASD) TABANLI KUMANDA SİSTEMİ
+TASARIM KARARI ve BAŞLANGIÇ DOKÜMANI
+==================================================
+
+Bu doküman, İKA’nın manuel ve yarı otonom sürüşü için
+PC klavyesi (WASD) tabanlı bir kumanda sisteminin
+neden ve nasıl tasarlandığını, kontrol mantığını ve
+bundan sonra izlenecek başlangıç yolunu açıklar.
+
+==================================================
+1) NEDEN PC (WASD) TABANLI KUMANDA?
+==================================================
+
+Hazır RC kumandalar:
+- Pahalı
+- Bütçe ve erişim açısından sınırlayıcı
+
+Custom RF kumandalar (ESP32 vb.):
+- Araçta ekstra donanım
+- Ek ağırlık
+- Ek güç tüketimi
+- Daha karmaşık debug ve risk
+
+Bu nedenle aşağıdaki karar alınmıştır:
+
+- Kumanda = PC / Laptop klavyesi
+- Haberleşme = Wi-Fi
+- Araçta ekstra kart yok
+- Mevcut Raspberry Pi 4 + Pico altyapısı kullanılır
+
+Bu yaklaşım:
+- Ucuz
+- Hızlı geliştirilebilir
+- Mekanik ve sürüş testleri için ideal
+- Saha (Teknofest) ortamında internet olmadan çalışabilir
+
+==================================================
+2) SEÇİLEN MİMARİ (NET AKIŞ)
+==================================================
+
+Kontrol zinciri şu şekildedir:
+
+PC (WASD klavye)
+        ↓ Wi-Fi (UDP)
+Raspberry Pi 4 (Access Point + kontrol köprüsü)
+        ↓ USB Serial
+Raspberry Pi Pico
+        ↓
+4 DC Motor (ileri / geri itki)
+2 Servo Motor (direksiyon)
+
+Roller:
+- PC: Sadece “sürücü niyeti” üretir
+- Pi 4: Wi-Fi, güvenlik, timeout, köprü
+- Pico: Gerçek zamanlı motor + servo sürüşü
+
+==================================================
+3) SÜRÜŞ MODELİ (ARAÇ NASIL HAREKET EDİYOR?)
+==================================================
+
+Araç:
+- 4 DC motor ile ileri / geri hareket eder
+- 2 servo motor ile yön değiştirir (direksiyon)
+
+Bu bir “tank drive” değildir.
+Dönüş servo ile yapılır, motor hız farkıyla değil.
+
+Yani:
+- Throttle = DC motorlar
+- Steer = Servo motorlar
+
+==================================================
+4) KLAVYE TABANLI KUMANDA MANTIĞI
+==================================================
+
+Klavye analog olmadığı için:
+- Ramp (yumuşatma)
+- Hız limitleri
+- Güvenlik katmanları
+zorunludur.
+
+--------------------------
+4.1 Hız Modları (3 Seviye)
+--------------------------
+
+İleri / geri hareket 3 farklı modda yapılır:
+
+- YÜRÜTME (Slow / Precision):
+  CTRL + W  → yavaş ileri
+  CTRL + S  → yavaş geri
+
+- NORMAL:
+  W → normal ileri
+  S → normal geri
+
+- DEPAR (Boost):
+  SHIFT + W → hızlı / atak ileri
+  (SHIFT + S opsiyonel, istenirse kapatılabilir)
+
+Bu yapı sayesinde:
+- Hassas manevra
+- Normal sürüş
+- Anlık hızlanma
+tek tuş kombinasyonlarıyla yapılır.
+
+--------------------------
+4.2 Dönüş (Steering)
+--------------------------
+
+- A → sola dön
+- D → sağa dön
+
+Kombinasyonlar desteklenir:
+- W + D → ileri giderken sağa kır
+- W + A → ileri giderken sola kır
+
+Throttle ve steer tamamen ayrıdır.
+Bu, karmaşa yaratmaz; araba sürüşü gibidir.
+
+Servo açısı:
+- Basılı tutma süresine göre kademeli artar
+- Tuş bırakıldığında servo yumuşak şekilde merkeze döner
+
+--------------------------
+4.3 Ani Durdurma (Emergency Brake)
+--------------------------
+
+Klavye ile “iki kere bas” gibi kombinasyonlar
+kararsız olabileceği için net tuşlar tanımlanır:
+
+- X → ani fren (soft emergency brake)
+- ESC → E-STOP (kilitli acil durdurma)
+- R → E-STOP reset (bilerek)
+
+--------------------------
+4.4 Deadman (Zorunlu Güvenlik)
+--------------------------
+
+- SPACE = deadman tuşu
+- SPACE basılı değilse:
+  - throttle = 0
+  - araç hareket edemez
+
+Bu sayede:
+- El klavyeden çekilirse
+- PC donarsa
+araç otomatik durur.
+
+--------------------------
+4.5 Rampada Kalma / Hold
+--------------------------
+
+S ve fren komutlarının karışmaması için
+ayrı bir “hold” tuşu tanımlanır:
+
+- H → Hill-Hold / Brake-Hold
+
+H basılıyken:
+- Throttle = 0
+- Araç yerinde tutulur
+
+Bu sayede:
+- S tamamen “geri” olarak kalır
+- Fren / tutma ayrı bir kontrol olur
+
+==================================================
+5) GÜVENLİK PRENSİPLERİ (TARTIŞMASIZ)
+==================================================
+
+Güvenlik iki katmanda uygulanır:
+
+--------------------------
+5.1 PC / Pi Katmanı
+--------------------------
+
+- PC → Pi paketleri 20–50 Hz gönderilir
+- 250 ms paket gelmezse:
+  - Pi, Pico’ya STOP gönderir
+
+--------------------------
+5.2 Pico Katmanı
+--------------------------
+
+Pico tarafında HER ZAMAN şu sıra geçerlidir:
+
+1) E-STOP aktif → motor = 0, servo = center
+2) ARM yok → motor = 0
+3) Deadman yok → motor = 0
+4) Komut timeout → motor = 0
+5) Aksi halde motor + servo sür
+
+Bu kurallar asla bypass edilmez.
+
+==================================================
+6) PC → Pi → Pico HABERLEŞME
+==================================================
+
+PC → Pi:
+- UDP
+- Düşük gecikme
+- Paket formatı:
+  thr, steer, speed_mode, flags, seq
+
+Pi → Pico:
+- USB Serial
+- Basit metin komutu:
+  SET thr steer flags seq
+
+Pico:
+- Komutu parse eder
+- Güvenliği yeniden kontrol eder
+- PWM üretir
+
+==================================================
+7) NEDEN ACCESS POINT (AP) MODU?
+==================================================
+
+Pi 4, kendi Wi-Fi ağını açar.
+
+Avantajları:
+- İnternet gerekmez
+- Saha ortamında stabil
+- Kalabalık Wi-Fi’dan etkilenmez
+- Kontrol tamamen araç tarafındadır
+
+Bu nedenle:
+- Pi 4 = Access Point
+- PC = bu ağa bağlanan kumanda
+
+==================================================
+8) BAŞLANGIÇ NOKTASI (NEREDEN BAŞLIYORUZ?)
+==================================================
+
+Bu sistem adım adım kurulacaktır.
+
+Önerilen ve KABUL EDİLEN sıra:
+
+A) Raspberry Pi 4 Access Point kurulumu
+B) PC WASD kumanda yazılımı
+C) Pi UDP → Pico USB köprüsü
+D) Pico motor + servo + failsafe yazılımı
+
+Bu README itibarıyla:
+- Mimari netleşmiştir
+- Kumanda davranışı netleşmiştir
+- Güvenlik kuralları belirlenmiştir
+
+==================================================
+9) SON KARAR
+==================================================
+
+Bu proje için:
+- PC (WASD) tabanlı kumanda
+- Pi 4 Access Point
+- Pico real-time sürüş
+yaklaşımı resmi olarak seçilmiştir.
+
+Bir sonraki adım:
+**Raspberry Pi 4 Access Point (AP) kurulumudur.**
+
+==================================================
+
+==================================================
+AŞAMA A — RASPBERRY PI 4 ACCESS POINT (AP) KURULUMU
+PC (WASD) → Pi 4 → Pico KONTROL SİSTEMİ
+==================================================
+
+Bu bölümde Raspberry Pi 4, kendi Wi-Fi ağını açan
+bir Access Point (AP) haline getirilir.
+
+Amaç:
+- PC (kumanda) → Pi 4 → Pico kontrol zincirini kurmak
+- İnternete ihtiyaç duymadan çalışmak
+- Saha (Teknofest) ortamında stabil bağlantı sağlamak
+
+Bu AP yalnızca kontrol amaçlıdır.
+İnternet paylaşımı yapılmaz.
+
+==================================================
+1) GENEL MİMARİ
+==================================================
+
+PC (WASD klavye)
+      │
+      │ Wi-Fi (UDP)
+      ▼
+Raspberry Pi 4 (Access Point + UDP Bridge)
+      │
+      │ USB Serial
+      ▼
+Raspberry Pi Pico (Motor + Servo kontrol)
+
+Pi 4 IP adresi:
+- 192.168.4.1
+
+PC bu ağa bağlanır ve Pi’ye UDP paket gönderir.
+
+==================================================
+2) GEREKLİ PAKETLERİN KURULUMU
+==================================================
+
+Raspberry Pi 4 terminalinde:
+
+sudo apt update
+sudo apt install -y hostapd dnsmasq
+
+Kurulumdan sonra servisleri durdur:
+
+sudo systemctl stop hostapd
+sudo systemctl stop dnsmasq
+
+==================================================
+3) WLAN0 İÇİN SABİT IP AYARI
+==================================================
+
+AP için Pi’ye sabit IP atanır.
+
+Dosyayı aç:
+
+sudo nano /etc/dhcpcd.conf
+
+Dosyanın EN ALTINA EKLE:
+
+interface wlan0
+    static ip_address=192.168.4.1/24
+    nohook wpa_supplicant
+
+Kaydet ve çık:
+- Ctrl + O
+- Enter
+- Ctrl + X
+
+==================================================
+4) DHCP SERVER (dnsmasq) AYARI
+==================================================
+
+Varsayılan dosyayı yedekle:
+
+sudo mv /etc/dnsmasq.conf /etc/dnsmasq.conf.orig
+
+Yeni yapılandırmayı oluştur:
+
+sudo nano /etc/dnsmasq.conf
+
+İçine SADECE şunu yaz:
+
+interface=wlan0
+dhcp-range=192.168.4.10,192.168.4.50,255.255.255.0,24h
+
+Bu ayar:
+- wlan0 üzerinden IP dağıtır
+- PC’ye otomatik IP verir
+
+==================================================
+5) ACCESS POINT (hostapd) AYARI
+==================================================
+
+AP yapılandırma dosyasını oluştur:
+
+sudo nano /etc/hostapd/hostapd.conf
+
+İçeriği:
+
+interface=wlan0
+driver=nl80211
+ssid=IKA_CONTROL
+hw_mode=g
+channel=6
+wmm_enabled=0
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase=ika12345
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+
+Notlar:
+- Wi-Fi adı (SSID): IKA_CONTROL
+- Şifre: ika12345 (istersen değiştir)
+- İnternet yok, sadece lokal ağ
+
+==================================================
+6) hostapd KONFİG DOSYASINI TANITMA
+==================================================
+
+Dosyayı aç:
+
+sudo nano /etc/default/hostapd
+
+Şu satırı BUL:
+
+#DAEMON_CONF=""
+
+Şu şekilde DEĞİŞTİR:
+
+DAEMON_CONF="/etc/hostapd/hostapd.conf"
+
+==================================================
+7) SERVİSLERİ AKTİF ETME
+==================================================
+
+sudo systemctl unmask hostapd
+sudo systemctl enable hostapd
+sudo systemctl enable dnsmasq
+
+==================================================
+8) SİSTEMİ YENİDEN BAŞLAT
+==================================================
+
+sudo reboot
+
+==================================================
+9) TEST — PC’DEN BAĞLANTI KONTROLÜ
+==================================================
+
+PC tarafında:
+- Wi-Fi listesinde **IKA_CONTROL** ağını gör
+- Şifre: ika12345
+- Bağlan
+
+PC’de terminal / CMD aç:
+
+ping 192.168.4.1
+
+Eğer cevap geliyorsa:
+- Access Point çalışıyor
+- Ağ stabil
+- Bir sonraki aşamaya hazırsın
+
+==================================================
+10) BU AŞAMANIN CHECKPOINT’İ
+==================================================
+
+Bu aşama başarılıysa:
+
+- Pi 4 kendi Wi-Fi ağını açıyor
+- PC bu ağa bağlanabiliyor
+- İnternetsiz iletişim var
+- Gecikme düşük
+- Saha kullanımına uygun altyapı hazır
+
+Bu aşamada:
+- Motor sürülmez
+- Servo sürülmez
+- Sadece ağ altyapısı kurulur
+
+==================================================
+11) SONRAKİ AŞAMA
+==================================================
+
+AŞAMA B:
+PC üzerinde WASD kumanda yazılımı
+
+- Tuş okuma
+- Depar / normal / yürütme modları
+- Deadman
+- E-STOP
+- UDP paket gönderimi
+
+==================================================
+
+==================================================
+AŞAMA B — PC (WASD) TABANLI KUMANDA YAZILIMI
+==================================================
+
+Bu bölümde PC (Laptop) üzerinde çalışan Python tabanlı
+bir WASD kumanda yazılımı hazırlanır.
+
+Amaç:
+- Klavye ile araç sürüş niyeti üretmek
+- Depar / normal / yürütme modlarını desteklemek
+- Deadman, E-STOP, ani fren, hold mantıklarını uygulamak
+- Komutları Raspberry Pi 4’e UDP ile göndermek
+
+==================================================
+1) GENEL ÇALIŞMA PRENSİBİ
+==================================================
+
+PC:
+- Klavyeden tuşları okur (non-blocking)
+- Throttle ve steer hedefleri üretir
+- Ramp (yumuşatma) uygular
+- Güvenlik kurallarını uygular
+- 20–50 Hz hızla UDP paket gönderir
+
+Bu aşamada:
+- Motor sürülmez
+- Servo sürülmez
+- Sadece kontrol komutu üretilir
+
+==================================================
+2) TUŞ HARİTASI (FİNAL)
+==================================================
+
+Hız / yön:
+- W  : ileri
+- S  : geri
+- A  : sola dön
+- D  : sağa dön
+
+Hız modları:
+- CTRL + W / S  : YÜRÜTME (slow)
+- W / S         : NORMAL
+- SHIFT + W     : DEPAR (boost)
+
+Güvenlik:
+- SPACE : Deadman (basılı tut)
+- X     : Ani fren (soft brake)
+- ESC   : E-STOP (kilitli)
+- R     : E-STOP reset
+
+Diğer:
+- H     : Hill-hold / brake-hold
+- 1     : MANUAL
+- 2     : ASSIST
+- 3     : AUTO
+
+==================================================
+3) HIZ MODLARI VE LİMİTLER
+==================================================
+
+Throttle değeri normalize edilir:
+- Aralık: -1000 .. +1000
+
+Modlara göre maksimum throttle:
+- YÜRÜTME : ±250
+- NORMAL  : ±600
+- DEPAR   : ±1000
+
+==================================================
+4) RAMP (YUMUŞATMA) MANTIĞI
+==================================================
+
+Klavye analog olmadığı için:
+- Throttle
+- Steer
+
+değerleri hedefe aniden atlamaz.
+
+Her döngüde:
+- Mevcut değer, hedefe doğru kademeli yaklaşır
+- Böylece:
+  - Motor zıplamaz
+  - Servo titremez
+  - Sürüş hissi yumuşak olur
+
+==================================================
+5) GÜVENLİK KURALLARI (PC TARAFI)
+==================================================
+
+Her döngüde şu sıra uygulanır:
+
+1) E-STOP aktifse:
+   - throttle = 0
+   - steer = 0
+   - sadece reset beklenir
+
+2) Deadman (SPACE) basılı değilse:
+   - throttle = 0
+
+3) Ani fren (X):
+   - throttle hızlıca 0’a çekilir
+
+4) Hold (H):
+   - throttle = 0 (araç tutulur)
+
+==================================================
+6) UDP PAKET FORMATI
+==================================================
+
+PC → Pi UDP paketi:
+
+thr,ste,mode,flags,seq
+
+Alanlar:
+- thr   : -1000 .. +1000
+- ste   : -1000 .. +1000
+- mode  : 0=MANUAL, 1=ASSIST, 2=AUTO
+- flags :
+    bit0 = ARM
+    bit1 = DEADMAN
+    bit2 = ESTOP
+    bit3 = BRAKE
+    bit4 = HOLD
+- seq   : paket sayacı
+
+Örnek:
+120,-300,0,3,57
+
+==================================================
+7) PC KUMANDA PYTHON KODU
+==================================================
+
+Aşağıdaki kodu PC’de bir dosyaya kaydet:
+
+Dosya adı:
+pc_controller.py
+
+--------------------------------------------------
+```python
+import socket
+import time
+import keyboard
+
+PI_IP = "192.168.4.1"
+PI_PORT = 9000
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+thr = 0
+ste = 0
+mode = 0
+seq = 0
+
+MAX_THR = {
+    "slow": 250,
+    "normal": 600,
+    "boost": 1000
+}
+
+RAMP_THR = 40
+RAMP_STE = 60
+
+estop = False
+
+def ramp(cur, target, step):
+    if cur < target:
+        return min(cur + step, target)
+    if cur > target:
+        return max(cur - step, target)
+    return cur
+
+while True:
+    flags = 0
+
+    # --- E-STOP ---
+    if keyboard.is_pressed("esc"):
+        estop = True
+    if keyboard.is_pressed("r"):
+        estop = False
+
+    if estop:
+        thr = 0
+        ste = 0
+        flags |= (1 << 2)
+    else:
+        deadman = keyboard.is_pressed("space")
+        if deadman:
+            flags |= (1 << 1)
+
+        # --- MODE ---
+        if keyboard.is_pressed("1"):
+            mode = 0
+        elif keyboard.is_pressed("2"):
+            mode = 1
+        elif keyboard.is_pressed("3"):
+            mode = 2
+
+        # --- SPEED MODE ---
+        if keyboard.is_pressed("ctrl"):
+            limit = MAX_THR["slow"]
+        elif keyboard.is_pressed("shift"):
+            limit = MAX_THR["boost"]
+        else:
+            limit = MAX_THR["normal"]
+
+        target_thr = 0
+        target_ste = 0
+
+        # --- THROTTLE ---
+        if keyboard.is_pressed("w"):
+            target_thr = limit
+        elif keyboard.is_pressed("s"):
+            target_thr = -limit
+
+        # --- STEERING ---
+        if keyboard.is_pressed("a"):
+            target_ste = -1000
+        elif keyboard.is_pressed("d"):
+            target_ste = 1000
+
+        # --- BRAKE ---
+        if keyboard.is_pressed("x"):
+            target_thr = 0
+            flags |= (1 << 3)
+
+        # --- HOLD ---
+        if keyboard.is_pressed("h"):
+            target_thr = 0
+            flags |= (1 << 4)
+
+        # --- DEADMAN CHECK ---
+        if not deadman:
+            target_thr = 0
+
+        thr = ramp(thr, target_thr, RAMP_THR)
+        ste = ramp(ste, target_ste, RAMP_STE)
+
+    msg = f"{thr},{ste},{mode},{flags},{seq}"
+    sock.sendto(msg.encode(), (PI_IP, PI_PORT))
+
+    seq = (seq + 1) % 256
+    time.sleep(0.02)
+==================================================
+8) BU AŞAMANIN CHECKPOINT’İ
+
+Bu aşama başarılıysa:
+
+- PC’den tuşlara basıldığında
+
+- UDP paketleri Pi’ye gidiyor
+
+- Throttle / steer değerleri mantıklı değişiyor
+
+- Deadman ve E-STOP çalışıyor
+
+Bu aşamada:
+
+- Araç hareket ETMEZ
+
+- Sadece kontrol verisi üretilir
+
+==================================================
+9) SONRAKİ AŞAMA
+
+AŞAMA C:
+Raspberry Pi 4 üzerinde
+UDP → USB Serial köprü (Pi → Pico)
+
+==================================================
+
+==================================================
+AŞAMA C — RASPBERRY PI 4
+UDP → USB SERIAL KÖPRÜ (PC → Pi → Pico)
+==================================================
+
+Bu aşamada Raspberry Pi 4,
+PC’den UDP ile gelen WASD kumanda paketlerini alır,
+timeout ve güvenlik uygular
+ve komutları USB Serial üzerinden
+Raspberry Pi Pico’ya iletir.
+
+Amaç:
+- PC → Pi → Pico kontrol zincirini tamamlamak
+- Wi-Fi kopmalarında aracı otomatik durdurmak
+- Pico’ya sade ve güvenli komut göndermek
+
+==================================================
+1) ÖN KOŞULLAR
+==================================================
+
+- AŞAMA A tamamlanmış olmalı
+  (Pi 4 Access Point: IKA_CONTROL çalışıyor)
+- PC bu Wi-Fi ağına bağlı olmalı
+- AŞAMA B (pc_controller.py) hazır olmalı
+- Pico USB kablo ile Pi 4’e bağlı olmalı
+- Thonny KAPALI olmalı (serial port kilitlenmesin)
+
+==================================================
+2) PICO USB SERIAL PORTUNU BUL
+==================================================
+
+Pi 4 terminalinde:
+
+ls /dev/ttyACM*
+
+Genellikle çıktı:
+- /dev/ttyACM0
+
+Eğer birden fazla varsa:
+- Pico hangisiyse onu kullanacağız
+
+==================================================
+3) GEREKLİ PAKET (PYTHON SERIAL)
+==================================================
+
+Pi 4’te:
+
+sudo apt update
+sudo apt install -y python3-serial
+
+==================================================
+4) PI UDP → PICO SERIAL BRIDGE DOSYASI
+==================================================
+
+Pi 4’te dosya oluştur:
+
+nano ~/pi_udp_bridge.py
+
+Aşağıdaki kodu **aynen** yapıştır:
+
+```python
+import socket
+import serial
+import time
+
+# -----------------------------
+# UDP AYARLARI (PC -> Pi)
+# -----------------------------
+UDP_IP = "0.0.0.0"
+UDP_PORT = 9000
+
+# -----------------------------
+# PICO USB SERIAL AYARLARI
+# -----------------------------
+SERIAL_PORT = "/dev/ttyACM0"
+BAUDRATE = 115200
+
+# -----------------------------
+# TIMEOUT (GÜVENLİK)
+# -----------------------------
+UDP_TIMEOUT = 0.25  # saniye (250 ms)
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.setblocking(False)
+
+ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.05)
+time.sleep(2)
+
+print("UDP -> PICO BRIDGE BASLADI")
+print("UDP port:", UDP_PORT, "Serial:", SERIAL_PORT)
+
+last_rx_time = time.time()
+
+def send_stop():
+    # Pico komut formatı:
+    # SET thr ste flags seq
+    ser.write(b"SET 0 0 0 0\n")
+
+while True:
+    try:
+        data, addr = sock.recvfrom(1024)
+        msg = data.decode(errors="replace").strip()
+        last_rx_time = time.time()
+
+        # PC'den gelen format:
+        # thr,ste,mode,flags,seq
+        parts = msg.split(",")
+        if len(parts) == 5:
+            thr, ste, mode, flags, seq = parts
+            pico_cmd = f"SET {thr} {ste} {flags} {seq}\n"
+            ser.write(pico_cmd.encode())
+        else:
+            send_stop()
+
+    except BlockingIOError:
+        pass
+    except Exception:
+        send_stop()
+
+    # Timeout: PC'den paket gelmezse STOP
+    if time.time() - last_rx_time > UDP_TIMEOUT:
+        send_stop()
+
+    time.sleep(0.01)
+Kaydet ve çık:
+
+- Ctrl + O → Enter
+
+- Ctrl + X
+
+==================================================
+5) BRIDGE’İ ÇALIŞTIR
+
+Pi 4’te:
+
+python3 ~/pi_udp_bridge.py
+
+Terminal çıktısı şöyle olmalı:
+
+UDP -> PICO BRIDGE BASLADI
+UDP port: 9000 Serial: /dev/ttyACM0
+
+==================================================
+6) PC TARAFI TEST
+
+PC’de:
+
+python pc_controller.py
+
+- Script hata vermeden çalışmalı
+
+- Tuşlara basınca Pi tarafı kapanmamalı
+
+==================================================
+7) ÇALIŞMA AKIŞI (DOĞRULAMA)
+
+Bu akış doğruysa sistem OK demektir:
+
+- PC → UDP paket gönderiyor
+
+- Pi → paketleri alıyor
+
+- Pi → Pico’ya SET komutu yolluyor
+
+- PC kapanınca / Wi-Fi kopunca:
+
+   - Pi 250 ms içinde STOP gönderiyor
+
+==================================================
+8) SIK HATALAR ve HIZLI ÇÖZÜM
+
+(1) Serial port bulunamadı:
+
+- ls /dev/ttyACM* ile doğru portu bul
+
+- SERIAL_PORT değişkenini güncelle
+
+(2) Permission hatası:
+
+- Thonny kapalı olsun
+
+- Pico başka program tarafından kullanılmasın
+
+(3) UDP gelmiyor:
+
+- PC IKA_CONTROL ağına bağlı mı?
+
+- PC scriptinde PI_IP = "192.168.4.1" mi?
+
+- UDP port iki tarafta da 9000 mi?
+
+==================================================
+9) BU AŞAMANIN SONUCU
+
+Bu aşama tamamlandığında:
+
+- PC → Pi → Pico iletişimi kurulmuştur
+
+- Timeout ve güvenlik çalışmaktadır
+
+- Pico’ya güvenli SET komutları ulaşmaktadır
+
+Bu aşamada:
+
+- Motorlar sürülmez
+
+- Servolar sürülmez
+
+- Sadece haberleşme doğrulanır
+
+Bir sonraki aşama:
+AŞAMA D — Pico üzerinde
+motor + servo + failsafe ANA kontrol yazılımı
+
+==================================================
+
+
+==================================================
+AŞAMA D — RASPBERRY PI PICO
+ANA KONTROL YAZILIMI (MOTOR + SERVO + FAILSAFE)
+==================================================
+
+Bu aşamada Raspberry Pi Pico:
+- Pi’den USB Serial ile gelen komutları okur (SET ...)
+- Güvenlik kurallarını uygular (E-STOP / deadman / timeout)
+- 4 DC motor sürücüyü (RPWM/LPWM tipi) sürer
+- 2 servo ile direksiyon kontrolü yapar (mirror + trim)
+- Ramp (yumuşatma) uygular
+
+Bu aşama tamamlanınca araç gerçekten hareket eder.
+
+==================================================
+0) ÖNEMLİ GÜVENLİK UYARISI (OKU)
+==================================================
+
+İlk testte:
+- Tekerleri yerden kes (aracı yükselt)
+- Pervane/teker/dişli gibi hareketli parçalardan uzak dur
+- E-STOP / STOP komutunu test etmeden aracı yere koyma
+- İlk testte throttle limitlerini düşük tut (ör. NORMAL=300 gibi)
+
+==================================================
+1) PICO TARAFINDA KOMUT FORMATI
+==================================================
+
+Pi, Pico’ya şu komutu gönderir:
+
+SET thr ste flags seq
+
+- thr   : -1000 .. +1000 (ileri/geri)
+- ste   : -1000 .. +1000 (sol/sağ)
+- flags :
+    bit1 = DEADMAN (SPACE basılı)
+    bit2 = ESTOP
+    bit3 = BRAKE (X)
+    bit4 = HOLD  (H)
+- seq   : 0..255 (paket sayacı)
+
+Örnek:
+SET 600 200 2 55
+
+==================================================
+2) FAILSAFE KURALLARI (PICO'DA ASLA BYPASS YOK)
+==================================================
+
+Pico şu sırayı uygular:
+
+1) ESTOP aktifse:
+   - throttle = 0
+   - servo = center
+   - motorlar stop
+
+2) DEADMAN yoksa:
+   - throttle = 0
+   - servo istersen center (önerilen)
+
+3) Komut timeout olursa (örn. >300ms):
+   - throttle = 0
+   - servo center
+
+4) BRAKE/HOLD:
+   - throttle hedefi 0'a çekilir
+   - (aktif fren varsa uygulanır)
+
+==================================================
+3) PIN PLANLAMA (SEN DOLDURACAKSIN)
+==================================================
+
+Bu README’de pinleri “placeholder” bırakıyoruz.
+Sen kendi şemana göre burayı dolduracaksın.
+
+--- SERVO PINLERİ ---
+SERVO_LEFT_PIN  = GPxx
+SERVO_RIGHT_PIN = GPyy
+
+--- MOTOR SÜRÜCÜLER (4 ADET) ---
+Her sürücü RPWM/LPWM ile sürülüyor varsayımı:
+
+Motor1: RPWM=GP__, LPWM=GP__
+Motor2: RPWM=GP__, LPWM=GP__
+Motor3: RPWM=GP__, LPWM=GP__
+Motor4: RPWM=GP__, LPWM=GP__
+
+NOT:
+- Eğer R_EN / L_EN pinleri kullanılıyorsa, onları da Pico GPIO’ya bağlayıp
+  sürekli 1 yapabiliriz veya ayrı pinle kontrol ederiz.
+- İlk etapta enable pinlerini donanımda HIGH yapmak en basiti.
+
+==================================================
+4) SERVO AYARLARI (CENTER / TRIM / LIMIT)
+==================================================
+
+Servo PWM:
+- 50 Hz
+- pulse: 1000–2000 us
+
+Parametreler:
+- SERVO_CENTER_US = 1500
+- SERVO_MIN_US    = 1100  (mekaniğe göre ayarla)
+- SERVO_MAX_US    = 1900  (mekaniğe göre ayarla)
+
+Mirror + trim:
+- sol  = center + k*steer + trim_L
+- sağ  = center - k*steer + trim_R
+
+Trim değerleri:
+- düz giderken tekerleri tam düz yapacak şekilde ayarlanır.
+
+==================================================
+5) THROTTLE LIMIT + RAMP
+==================================================
+
+PC tarafında limit var ama Pico tarafında da bir “hard limit” koyuyoruz:
+
+- THR_LIMIT = 800  (ilk testte 300-500 önerilir)
+
+Ramp:
+- throttle bir anda zıplamasın
+- her döngüde küçük adımlarla hedefe yaklaşsın
+
+==================================================
+6) PICO main.py (ANA KOD)
+==================================================
+
+Bu kodu Pico’ya main.py olarak kaydet:
+
+NOT:
+- MicroPython’da sadece main.py otomatik çalışır.
+  (main_text.py gibi isimler auto-run değildir.)
+
+--------------------------------------------------
+```python
+import time
+import sys
+import uselect
+from machine import Pin, PWM
+
+# ==================================================
+# 0) KENDİ PINLERİNİ BURADA DOLDUR
+# ==================================================
+
+# --- SERVO PİNLERİ ---
+SERVO_LEFT_PIN  = 14   # TODO: kendi pinin
+SERVO_RIGHT_PIN = 15   # TODO: kendi pinin
+
+# --- MOTOR PİNLERİ (RPWM/LPWM) ---
+M1_RPWM, M1_LPWM = 2, 3    # TODO
+M2_RPWM, M2_LPWM = 4, 5    # TODO
+M3_RPWM, M3_LPWM = 6, 7    # TODO
+M4_RPWM, M4_LPWM = 8, 9    # TODO
+
+# ==================================================
+# 1) PARAMETRELER
+# ==================================================
+
+# Servo parametreleri
+SERVO_FREQ = 50
+SERVO_CENTER_US = 1500
+SERVO_MIN_US = 1100
+SERVO_MAX_US = 1900
+
+# Servo trim (düz ayar)
+TRIM_L_US = 0
+TRIM_R_US = 0
+
+# steer ölçeği: steer(-1000..1000) -> us offset
+STEER_US_PER_1000 = 300  # 1000 steer -> 300us sapma (mekaniğe göre ayarla)
+
+# Motor PWM
+MOTOR_PWM_FREQ = 20000  # 20kHz (sessiz)
+THR_LIMIT = 600         # güvenli limit (ilk testte düşük tut)
+
+# ramp adımları
+RAMP_THR_STEP = 30      # her döngüde throttle değişimi
+RAMP_LOOP_DT  = 0.01
+
+# failsafe
+CMD_TIMEOUT_S = 0.30
+
+# ==================================================
+# 2) SERVO PWM SETUP
+# ==================================================
+
+servoL = PWM(Pin(SERVO_LEFT_PIN))
+servoR = PWM(Pin(SERVO_RIGHT_PIN))
+servoL.freq(SERVO_FREQ)
+servoR.freq(SERVO_FREQ)
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def servo_write_us(pwm_obj, us):
+    # MicroPython PWM duty_ns kullanırsak daha düzgün:
+    pwm_obj.duty_ns(int(us * 1000))
+
+def set_steer(steer):
+    # steer: -1000..1000
+    steer = clamp(steer, -1000, 1000)
+    delta = int((steer * STEER_US_PER_1000) / 1000)
+
+    left_us  = SERVO_CENTER_US + delta + TRIM_L_US
+    right_us = SERVO_CENTER_US - delta + TRIM_R_US
+
+    left_us  = clamp(left_us,  SERVO_MIN_US, SERVO_MAX_US)
+    right_us = clamp(right_us, SERVO_MIN_US, SERVO_MAX_US)
+
+    servo_write_us(servoL, left_us)
+    servo_write_us(servoR, right_us)
+
+# ==================================================
+# 3) MOTOR PWM SETUP
+# ==================================================
+
+def make_pwm(pin_no):
+    p = PWM(Pin(pin_no))
+    p.freq(MOTOR_PWM_FREQ)
+    p.duty_u16(0)
+    return p
+
+m1_r = make_pwm(M1_RPWM); m1_l = make_pwm(M1_LPWM)
+m2_r = make_pwm(M2_RPWM); m2_l = make_pwm(M2_LPWM)
+m3_r = make_pwm(M3_RPWM); m3_l = make_pwm(M3_LPWM)
+m4_r = make_pwm(M4_RPWM); m4_l = make_pwm(M4_LPWM)
+
+motors = [(m1_r, m1_l), (m2_r, m2_l), (m3_r, m3_l), (m4_r, m4_l)]
+
+def motor_set_pair(pwm_r, pwm_l, throttle):
+    # throttle: -1000..1000
+    throttle = clamp(throttle, -1000, 1000)
+
+    # duty_u16: 0..65535
+    duty = int(abs(throttle) * 65535 / 1000)
+
+    if throttle > 0:
+        pwm_r.duty_u16(duty)
+        pwm_l.duty_u16(0)
+    elif throttle < 0:
+        pwm_r.duty_u16(0)
+        pwm_l.duty_u16(duty)
+    else:
+        pwm_r.duty_u16(0)
+        pwm_l.duty_u16(0)
+
+def set_throttle_all(throttle):
+    for pr, pl in motors:
+        motor_set_pair(pr, pl, throttle)
+
+def stop_all():
+    set_throttle_all(0)
+    set_steer(0)
+
+# ==================================================
+# 4) SERIAL KOMUT OKUMA (SET ...)
+# ==================================================
+
+poll = uselect.poll()
+poll.register(sys.stdin, uselect.POLLIN)
+
+target_thr = 0
+target_ste = 0
+
+cur_thr = 0
+cur_ste = 0
+
+flags = 0
+last_cmd_time = time.ticks_ms()
+
+def parse_set(line):
+    # line: "SET thr ste flags seq"
+    parts = line.strip().split()
+    if len(parts) != 5 or parts[0].upper() != "SET":
+        return None
+    thr = int(parts[1])
+    ste = int(parts[2])
+    flg = int(parts[3])
+    seq = int(parts[4])
+    return thr, ste, flg, seq
+
+def ramp(cur, target, step):
+    if cur < target:
+        return min(cur + step, target)
+    if cur > target:
+        return max(cur - step, target)
+    return cur
+
+print("PICO READY (main.py)")
+stop_all()
+
+buf = ""
+while True:
+    # 1) Komut oku
+    if poll.poll(0):
+        ch = sys.stdin.read(1)
+        if ch in ("\n", "\r"):
+            line = buf
+            buf = ""
+            parsed = parse_set(line)
+            if parsed:
+                thr_in, ste_in, flg_in, seq_in = parsed
+                flags = flg_in
+                last_cmd_time = time.ticks_ms()
+
+                # flags decode
+                deadman = (flags & (1 << 1)) != 0
+                estop   = (flags & (1 << 2)) != 0
+                brake   = (flags & (1 << 3)) != 0
+                hold    = (flags & (1 << 4)) != 0
+
+                if estop:
+                    target_thr = 0
+                    target_ste = 0
+                else:
+                    # steer her zaman alınır (istersen deadman yokken center yapabilirsin)
+                    target_ste = clamp(ste_in, -1000, 1000)
+
+                    # throttle güvenlik
+                    if (not deadman) or brake or hold:
+                        target_thr = 0
+                    else:
+                        # hard limit
+                        thr_in = clamp(thr_in, -THR_LIMIT, THR_LIMIT)
+                        target_thr = thr_in
+            # parse olmadıysa ignore
+        else:
+            buf += ch
+
+    # 2) Timeout failsafe
+    dt_ms = time.ticks_diff(time.ticks_ms(), last_cmd_time)
+    if dt_ms > int(CMD_TIMEOUT_S * 1000):
+        target_thr = 0
+        target_ste = 0
+
+    # 3) Ramp uygula
+    cur_thr = ramp(cur_thr, target_thr, RAMP_THR_STEP)
+    cur_ste = ramp(cur_ste, target_ste, 80)
+
+    # 4) Çıkışları uygula
+    set_throttle_all(cur_thr)
+    set_steer(cur_ste)
+
+    time.sleep(RAMP_LOOP_DT)
+
+==================================================
+7) PICO'YA YÜKLEME (mpremote ÖNERİLEN)
+
+Pi 4 üzerinde (venv içinden):
+
+source ~/venv-mp/bin/activate
+
+Pico'yu porttan bağla (genelde /dev/ttyACM0):
+
+mpremote connect /dev/ttyACM0 fs cp main.py :main.py
+mpremote connect /dev/ttyACM0 reset
+
+NOT:
+
+ - MicroPython’da sadece main.py otomatik çalışır.
+   main_text.py gibi isimler auto-run değildir.
+
+==================================================
+8) TEST PROSEDÜRÜ (SIRA SIRA)
+
+1. Aracı yerden kaldır (tekerler havada)
+
+2.Pi’de bridge çalışsın:
+  python3 ~/pi_udp_bridge.py
+
+3.PC’de kumanda çalışsın:
+  python pc_controller.py
+
+4.SPACE basılı değilken motor dönmemeli (deadman testi)
+
+5.SPACE + W ile motorlar dönmeli (ileri)
+
+6.A/D ile servo yön değişmeli
+
+7.ESC basınca E-STOP: motor=0, servo=center olmalı
+
+8.PC kapatınca/bağ kopunca 300ms içinde STOP olmalı (timeout)
+
+==================================================
+9) SIK SORUNLAR / ÇÖZÜM
+
+Motorlar ters dönüyor:
+-> ilgili motorun RPWM/LPWM pinlerini swap et
+-> veya throttle işaretini ters çevir
+
+Servo ters dönüyor:
+-> set_steer içinde delta işaretini ters çevir
+-> veya sağ/sol servo pinlerini değiştir
+
+Servo limitte zorlanıyor:
+-> SERVO_MIN_US ve SERVO_MAX_US değerlerini daralt
+-> STEER_US_PER_1000 değerini düşür
+
+Motorlar çok agresif:
+-> THR_LIMIT düşür
+-> RAMP_THR_STEP düşür
+
+Komut geliyor ama araç STOP:
+-> deadman flag gelmiyor olabilir (PC’de SPACE basılı mı?)
+-> Pi bridge çalışıyor mu?
+-> Pico timeout tetikleniyor olabilir (Wi-Fi kopuyor olabilir)
+
+==================================================
+10) BU AŞAMANIN SONUCU
+
+AŞAMA D tamamlanınca:
+
+- PC (WASD) → Pi (UDP bridge) → Pico (motor/servo) sistemi çalışır
+
+- Depar / normal / yürütme modları PC tarafında hazırdır
+
+- Pico failsafe ile güvenli sürüş sağlar
+
+==================================================
+
+==================================================
+AŞAMA E — SİSTEM ENTEGRASYONU, SON KONTROLLER
+VE SAHA ÖNCESİ CHECKLIST
+==================================================
+
+Bu aşama, AŞAMA A–D’de kurulan tüm bileşenlerin
+birlikte, güvenli ve stabil çalıştığının doğrulandığı
+SON ENTEGRASYON aşamasıdır.
+
+Bu aşamada:
+- Yeni kod yazılmaz
+- Mevcut kodlar birlikte çalıştırılır
+- Güvenlik, gecikme ve davranış testleri yapılır
+- Saha (Teknofest) öncesi hazır hale getirilir
+
+==================================================
+1) ENTEGRASYON AKIŞI (SON HAL)
+==================================================
+
+PC (WASD)
+  |
+  |  UDP (20–50 Hz)
+  |
+Raspberry Pi 4
+  - Access Point (IKA_CONTROL)
+  - UDP → USB Serial Bridge
+  |
+  |  USB Serial (CDC)
+  |
+Raspberry Pi Pico
+  - main.py
+  - failsafe
+  - motor + servo sürüş
+  |
+  v
+ARAÇ (4 DC motor + 2 servo)
+
+==================================================
+2) BAŞLATMA SIRASI (ÇOK ÖNEMLİ)
+==================================================
+
+HER ZAMAN bu sırayla aç:
+
+1) Raspberry Pi 4
+   - AP otomatik açılmalı
+   - pi_udp_bridge.py HENÜZ çalıştırma
+
+2) PC
+   - IKA_CONTROL ağına bağlan
+   - Wi-Fi stabil mi kontrol et
+
+3) Pico
+   - USB ile Pi’ye bağlı
+   - main.py otomatik çalışmalı
+   - Terminalde:
+     "PICO READY (main.py)" görmelisin
+
+4) Pi üzerinde bridge başlat:
+   python3 ~/pi_udp_bridge.py
+
+5) PC üzerinde kumanda başlat:
+   python pc_controller.py
+
+==================================================
+3) ZORUNLU GÜVENLİK TESTLERİ
+==================================================
+
+Bu testler GEÇMEDEN aracı yere koyma.
+
+--------------------------
+3.1 Deadman Testi
+--------------------------
+
+- SPACE basılı DEĞİL:
+  → W / S / A / D bas
+  → MOTORLAR DÖNMEMELİ
+
+- SPACE basılı:
+  → W / S bas
+  → MOTORLAR DÖNMELİ
+
+--------------------------
+3.2 E-STOP Testi
+--------------------------
+
+- Araç hareket halindeyken ESC bas
+- Beklenen:
+  - throttle = 0
+  - servo = center
+  - araç tamamen durur
+
+- R basmadan tekrar hareket ETMEMELİ
+
+--------------------------
+3.3 Timeout (Wi-Fi Kopma) Testi
+--------------------------
+
+- Araç hareket halindeyken:
+  - PC Wi-Fi kapat
+  - PC scripti kapat
+  - Pi bridge’i kapat
+
+Beklenen:
+- 250–300 ms içinde:
+  - motorlar durur
+  - servo center
+
+--------------------------
+3.4 Hold Testi
+--------------------------
+
+- H basılı:
+  - throttle = 0
+  - araç yerinde tutulur
+- H bırakınca:
+  - normal kontrol devam eder
+
+==================================================
+4) MEKANİK & ELEKTRİK KONTROLLERİ
+==================================================
+
+Kontrol et:
+
+- Motor sürücüler:
+  - GND ortak mı?
+  - Logic GND ile motor GND ortak mı?
+- Servo güç hattı:
+  - Pico 5V’tan çekilmiyor mu?
+  - Ayrı BEC / regülatör var mı?
+- USB kablosu:
+  - Oynarsa kopma olur → sabitle
+
+==================================================
+5) PARAMETRE İNCE AYAR (TUNING)
+==================================================
+
+Gerekirse Pico main.py’de ayarla:
+
+- THR_LIMIT
+  → araç çok agresifse düşür
+
+- RAMP_THR_STEP
+  → kalkış sertse düşür
+
+- STEER_US_PER_1000
+  → direksiyon çok keskinse düşür
+
+- SERVO_MIN_US / MAX_US
+  → mekanik zorlanıyorsa daralt
+
+==================================================
+6) SAHA MODU ÖNERİLERİ
+==================================================
+
+Sahada (Teknofest):
+
+- Laptop güçteyken kullan
+- Ekran kilidi / uyku KAPALI olsun
+- PC scriptini tmux/screen içinde çalıştır
+- Yedek USB kablo taşı
+- Yedek joystick fikri (ileride) aklında olsun
+
+==================================================
+7) BU AŞAMANIN SONUCU
+==================================================
+
+AŞAMA E tamamlandıysa:
+
+- Sistem uçtan uca çalışıyor
+- Güvenlik katmanları aktif
+- PC tabanlı kumanda stabil
+- Araç sürülebilir durumda
+- İKA manuel sürüş hazır
+
+Bu noktada:
+- Proje “çalışıyor” durumundadır
+- Sensörler ve otonomi eklenmeye hazırdır
+
+==================================================
+8) SONRAKİ AŞAMA (YENİ KONU)
+==================================================
+
+BUNDAN SONRA GEÇİLECEK KONULAR:
+
+AŞAMA F:
+- Sensör entegrasyonu
+  - HC-SR04 (mesafe)
+  - MPU6050 (IMU)
+
+AŞAMA G:
+- Yarı otonom sürüş
+  - hız sınırlama
+  - çarpışma önleme
+  - direksiyon destek
+
+AŞAMA H:
+- Tam otonom mimari (FSM / state machine)
+
+==================================================
+
+==================================================
+AŞAMA F — SENSÖR ENTEGRASYONU (HC-SR04 + MPU6050)
+==================================================
+
+Bu aşamada Raspberry Pi Pico üzerinde:
+- HC-SR04 ile mesafe ölçümü (ultrasonik)
+- MPU6050 ile IMU okuma (I2C: ivme + gyro)
+kurulur ve test edilir.
+
+Hedef:
+- Sensör verileri Pico’da okunacak
+- Debug için USB serial üzerinden Pi’ye/PC’ye basılacak
+- Sonraki aşamada (ASSIST mod) çarpışma önleme ve stabilizasyon için kullanılacak
+
+==================================================
+0) ÖNEMLİ UYARI (HC-SR04 SEVİYE)
+==================================================
+
+HC-SR04 Echo pini 5V çıkış verebilir.
+Pico GPIO 3.3V toleranslıdır.
+
+Bu yüzden:
+- Echo hattına mutlaka seviye düşürme koy:
+  - Direnç bölücü: Echo -> (2k) -> GPIO, GPIO -> (1k) -> GND
+  - veya hazır level shifter
+- Trig hattı 3.3V ile çalışır (genelde sorun olmaz)
+
+NOT:
+- JSN-SR04T farklıdır. Burada HC-SR04 varsayılmıştır.
+
+==================================================
+1) DONANIM BAĞLANTILARI
+==================================================
+
+--------------------------
+1.1 HC-SR04 Bağlantısı
+--------------------------
+
+HC-SR04 VCC  -> 5V (VBUS veya harici 5V reg/BEC)
+HC-SR04 GND  -> GND (Pico GND ile ortak)
+HC-SR04 TRIG -> Pico GPIO (ör: GP10)
+HC-SR04 ECHO -> Pico GPIO (ör: GP11)  [ARAYA SEVİYE DÜŞÜRME ŞART]
+
+Örnek seviye düşürme (direnç bölücü):
+Echo ---- 2k ----+---- GPIO (GP11)
+                 |
+                1k
+                 |
+                GND
+
+--------------------------
+1.2 MPU6050 (I2C) Bağlantısı
+--------------------------
+
+MPU6050 VCC -> 3.3V (bazı kartlar 5V kabul eder ama güvenlisi 3.3V)
+MPU6050 GND -> GND
+MPU6050 SDA -> Pico SDA (ör: GP0)
+MPU6050 SCL -> Pico SCL (ör: GP1)
+
+MPU6050 AD0:
+- GND ise I2C adresi 0x68
+- 3.3V ise I2C adresi 0x69
+
+==================================================
+2) PICO’DA TEK DOSYADA TEST KODU (SENSOR_TEST.PY)
+==================================================
+
+Bu kod:
+- HC-SR04 mesafeyi cm olarak ölçer
+- MPU6050’den ivme/gyro ham veriyi okur
+- USB serial'e periyodik yazdırır
+
+Dosya:
+sensor_test.py
+
+--------------------------------------------------
+```python
+import time
+from machine import Pin, I2C
+import utime
+
+# =========================
+# PINLER (KENDİ SİSTEMİNE GÖRE AYARLA)
+# =========================
+HC_TRIG = 10
+HC_ECHO = 11
+
+I2C_ID = 0
+I2C_SDA = 0
+I2C_SCL = 1
+
+MPU_ADDR = 0x68  # AD0=GND ise
+
+# =========================
+# HC-SR04 SETUP
+# =========================
+trig = Pin(HC_TRIG, Pin.OUT)
+echo = Pin(HC_ECHO, Pin.IN)
+
+def hcsr04_distance_cm(timeout_us=30000):
+    # Trig pulse
+    trig.value(0)
+    utime.sleep_us(2)
+    trig.value(1)
+    utime.sleep_us(10)
+    trig.value(0)
+
+    # Echo start bekle
+    t0 = utime.ticks_us()
+    while echo.value() == 0:
+        if utime.ticks_diff(utime.ticks_us(), t0) > timeout_us:
+            return None
+
+    start = utime.ticks_us()
+
+    # Echo end bekle
+    while echo.value() == 1:
+        if utime.ticks_diff(utime.ticks_us(), start) > timeout_us:
+            return None
+
+    end = utime.ticks_us()
+
+    dur = utime.ticks_diff(end, start)  # us
+    # mesafe = (dur * 0.0343) / 2  (cm/us -> 0.0343)
+    cm = (dur * 0.0343) / 2
+    return cm
+
+# =========================
+# MPU6050 (I2C) SETUP
+# =========================
+i2c = I2C(I2C_ID, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=400000)
+
+def i2c_scan():
+    return i2c.scan()
+
+def mpu_write(reg, val):
+    i2c.writeto_mem(MPU_ADDR, reg, bytes([val]))
+
+def mpu_read(reg, n):
+    return i2c.readfrom_mem(MPU_ADDR, reg, n)
+
+def to_int16(msb, lsb):
+    v = (msb << 8) | lsb
+    return v - 65536 if v & 0x8000 else v
+
+def mpu_init():
+    # PWR_MGMT_1 (0x6B) -> 0: wake up
+    mpu_write(0x6B, 0x00)
+    time.sleep_ms(50)
+
+def mpu_read_acc_gyro():
+    # ACCEL_XOUT_H (0x3B) .. GYRO_ZOUT_L (0x48) => 14 byte
+    data = mpu_read(0x3B, 14)
+    ax = to_int16(data[0], data[1])
+    ay = to_int16(data[2], data[3])
+    az = to_int16(data[4], data[5])
+    temp = to_int16(data[6], data[7])
+    gx = to_int16(data[8], data[9])
+    gy = to_int16(data[10], data[11])
+    gz = to_int16(data[12], data[13])
+    return ax, ay, az, temp, gx, gy, gz
+
+# =========================
+# MAIN TEST
+# =========================
+print("SENSOR TEST START")
+
+# I2C scan
+addrs = i2c_scan()
+print("I2C devices:", [hex(a) for a in addrs])
+
+# MPU init
+if MPU_ADDR in addrs:
+    mpu_init()
+    print("MPU6050 OK @", hex(MPU_ADDR))
+else:
+    print("MPU6050 NOT FOUND! check wiring / address")
+
+while True:
+    d = hcsr04_distance_cm()
+    if d is None:
+        d_str = "NA"
+    else:
+        d_str = "{:.1f}cm".format(d)
+
+    if MPU_ADDR in addrs:
+        ax, ay, az, temp, gx, gy, gz = mpu_read_acc_gyro()
+        print("DIST:", d_str,
+              "| ACC:", ax, ay, az,
+              "| GYR:", gx, gy, gz)
+    else:
+        print("DIST:", d_str, "| MPU: NA")
+
+    time.sleep(0.1)
+==================================================
+3) PICO’YA DOSYAYI YÜKLEME ve ÇALIŞTIRMA
+
+Pico’ya yüklemek için mpremote (Pi üzerinden):
+
+1. venv aktif et (varsayım: ~/venv-mp):
+   source ~/venv-mp/bin/activate
+
+2. dosyayı Pico’ya kopyala:
+   mpremote connect /dev/ttyACM0 fs cp sensor_test.py :sensor_test.py
+
+3. çalıştır:
+   mpremote connect /dev/ttyACM0 run sensor_test.py
+
+Alternatif:
+
+- Thonny ile Pico’ya bağlanıp sensor_test.py çalıştırabilirsin
+
+- Ama serial port çakışmalarına dikkat (bridge açıkken Thonny kapalı olmalı)
+
+==================================================
+4) CHECKPOINT (BU AŞAMA BAŞARILI MI?)
+
+Aşağıdakiler görülüyorsa OK:
+
+HC-SR04:
+
+- Elini sensöre yaklaştırınca mesafe azalmalı (cm)
+
+MPU6050:
+
+- I2C scan listesinde 0x68 veya 0x69 görünmeli
+
+- ACC/GYR değerleri cihaz hareket ettikçe değişmeli
+
+==================================================
+5) SONRAKİ ADIM (ASSIST MODE)
+
+Bir sonraki aşamada (AŞAMA G):
+
+- Mesafe belli eşik altına düşerse throttle limitlenir veya STOP olur
+
+- MPU6050 ile:
+
+   - titreşim/şok tespiti
+
+   - basit yönelim/denge yardımcıları
+     eklenir.
+
+==================================================
+
+==================================================
+AŞAMA G — YARI OTONOM (ASSIST) SÜRÜŞ
+ÇARPIŞMA ÖNLEME + HIZ SINIRLAMA + OVERRIDE MANTIĞI
+==================================================
+
+Bu aşamada manuel sürüş (PC WASD) korunur; ancak sensörler
+(HC-SR04 + MPU6050) ile sürüşe “yardımcı güvenlik katmanı”
+eklenir.
+
+Amaç:
+- Çarpışmayı önlemek (ön mesafe kritikse durdur / yavaşlat)
+- Hızları otomatik sınırlamak (yakın mesafede depar iptal)
+- Manuel sürüş hissini bozmadan koruma sağlamak
+- Her zaman kullanıcı override (E-STOP / deadman) üstte
+
+Bu aşama için kontrol mantığı:
+- MODE = ASSIST (PC’de 2 tuşu) aktifken çalışır
+- MODE = MANUAL (1 tuşu) iken sensörler sadece telemetri olur
+- MODE = AUTO (3 tuşu) ileride Pi otonomisine ayrılır
+
+==================================================
+1) ASSIST MODE KURAL SETİ (NET)
+==================================================
+
+Öncelik sırası (değişmez):
+1) E-STOP (ESC)    → her şey STOP
+2) Deadman yok     → throttle=0
+3) Timeout         → throttle=0
+4) ASSIST kuralları
+5) Normal sürüş çıkışı
+
+ASSIST kuralları:
+- Ön mesafe kritik ise STOP
+- Ön mesafe yakın ise hız limiti düşür
+- Direksiyon serbest (genelde) ama istersen “sert kırmayı” da limitlersin
+
+==================================================
+2) HC-SR04 EŞİKLERİ (ÖNERİLEN)
+==================================================
+
+Önerilen mesafe eşikleri (cm):
+- STOP_DIST_CM   = 25   (25cm altı kesin dur)
+- SLOW_DIST_CM   = 60   (60cm altı yavaşlat)
+- CLEAR_DIST_CM  = 80   (80cm üstü normale dön)
+
+Histerezis mantığı:
+- STOP’a girdiyse, CLEAR üstüne çıkana kadar STOP’tan çıkma
+- Bu sayede “titreme” olmaz
+
+==================================================
+3) HIZ SINIRLAMA (SOFT LIMIT) MANTIĞI
+==================================================
+
+PC’den gelen throttle: thr_cmd (-1000..1000)
+
+ASSIST çıkışı: thr_out
+
+Kurallar:
+- dist <= STOP_DIST_CM     → thr_out = 0
+- STOP_DIST_CM < dist < SLOW_DIST_CM
+  → thr_out = min(thr_cmd, THR_SLOW_LIMIT)
+- dist >= SLOW_DIST_CM
+  → thr_out = thr_cmd (normal)
+
+Öneri:
+- THR_SLOW_LIMIT = 250  (yürütme gibi)
+
+Ek kural:
+- Depar (SHIFT) ASSIST modda otomatik iptal edilebilir:
+  - dist < CLEAR_DIST_CM ise THR_LIMIT’i normal limitte tut
+
+==================================================
+4) “RAMPA / YOKUŞTA KALMA” (HOLD) İLE ÇAKIŞMA ÇÖZÜMÜ
+==================================================
+
+H tuşu (hold) basılıysa:
+- thr_out = 0 (ve sürücü destekliyorsa brake/hold uygulanır)
+
+S tuşu geri komutudur, HOLD değildir.
+Böylece:
+- geri ile fren karışmaz
+- yokuşta “yerinde tut” ayrı tuşla garanti edilir
+
+==================================================
+5) MPU6050 (IMU) ASSIST’TE NE İŞE YARAR?
+==================================================
+
+İlk etapta MPU6050:
+- Çarpışma/şok algılama (ani ivme artışı)
+- Aşırı yalpa / devrilme riski (yüksek pitch/roll değişimi)
+için “koruyucu” tetikleyici olarak kullanılır.
+
+Basit yaklaşım (ham veriden):
+- |ax| + |ay| + |az| ani yükselirse → thr_out = 0 (kısa süreli)
+- Bu, çarpışmada motoru keser (mekaniği korur)
+
+NOT:
+- Tam yönelim/denge için filtre (complementary/Kalman) ileride eklenir
+- Bu aşamada “koruma” amaçlı basit eşik yeterlidir
+
+==================================================
+6) ASSIST MODE NEREDE ÇALIŞACAK? (ÖNERİ)
+==================================================
+
+ASSIST kontrol mantığını Pico’da uygulamak en sağlıklısıdır.
+
+Neden:
+- Pico motor/servo sürüyor
+- Wi-Fi jitter Pi tarafında
+- Pico’da failsafe zaten var
+- Sensör verisi direkt Pico’da mevcut
+
+Yani:
+PC → Pi → Pico komutu gelir
+Pico:
+- sensörleri okur
+- ASSIST kurallarını uygular
+- motor/servo çıkışını üretir
+
+==================================================
+7) PICO ANA YAZILIMINDA YAPILACAK DEĞİŞİKLİKLER
+==================================================
+
+AŞAMA D main.py içine şu ekler yapılır:
+
+- MODE bilgisini Pico’ya iletmek (şu an Pi bridge mode’u göndermiyor)
+  → Güncelleme:
+    PC paketi: thr,ste,mode,flags,seq
+    Pi → Pico: SET thr ste mode flags seq
+
+- Pico parse_set fonksiyonu mode’u da alacak
+
+- Pico loop içinde:
+  - dist_cm oku (HC-SR04)
+  - IMU eşik kontrolü yap (opsiyon)
+  - Eğer mode==ASSIST:
+      thr_target = assist_limit(thr_cmd, dist_cm, imu_state)
+    else:
+      thr_target = thr_cmd
+
+==================================================
+8) BU AŞAMADA GEREKEN KÜÇÜK PROTOKOL GÜNCELLEMESİ
+==================================================
+
+Şu an Pi bridge komutu:
+SET thr ste flags seq
+
+ASSIST için gerekli:
+SET thr ste mode flags seq
+
+Bu nedenle:
+- PC kumanda zaten mode üretiyor (1/2/3)
+- Pi bridge, mode’u Pico’ya da geçecek
+- Pico, mode’a göre assist uygulayacak
+
+==================================================
+9) CHECKPOINT (ASSIST BAŞARILI MI?)
+==================================================
+
+ASSIST mod testi:
+
+1) MODE=ASSIST (PC’de 2)
+2) SPACE + W ile ileri git
+3) Önüne engel koy (mesafe < 60cm)
+   - hız otomatik düşmeli
+4) Engeli çok yaklaştır (mesafe < 25cm)
+   - araç STOP olmalı
+5) Engel çek (mesafe > 80cm)
+   - tekrar normal sürüşe dönmeli
+6) ESC E-STOP her zaman çalışmalı
+7) Wi-Fi kopunca timeout ile STOP olmalı
+
+==================================================
+10) SONRAKİ AŞAMA
+==================================================
+
+AŞAMA H — AUTO (Tam otonom) mimarisi
+- FSM (state machine)
+- Pi tarafında vision + path
+- Pico tarafında low-level control
+- Override ve güvenlik katmanları
+
+==================================================
+==================================================
+AŞAMA H — TAM OTONOM (AUTO) MİMARİSİ
+FSM (STATE MACHINE) + OVERRIDE + GÜVENLİK TASARIMI
+==================================================
+
+Bu aşamada sistem “tam otonom” çalışabilecek şekilde kurgulanır.
+Manuel ve Assist modları korunur; AUTO modda kontrolün büyük kısmı
+Pi 4’te (yüksek seviye karar) olur, Pico ise (düşük seviye sürüş)
+motor/servo ve güvenlikten sorumludur.
+
+Amaç:
+- AUTO modda aracın kendi kendine ilerlemesi
+- Engel görünce/yaklaşınca durması ve manevra yapması
+- Manuel override her zaman mümkün olması
+- E-STOP / Deadman / Timeout ile güvenli duruş garanti edilmesi
+
+==================================================
+1) ROLLERİN AYRILMASI (HIGH vs LOW LEVEL)
+==================================================
+
+--------------------------
+1.1 HIGH-LEVEL (Pi 4)
+--------------------------
+- Durum makinesi (FSM) kararlarını verir:
+  - ileri git / dur / sağa kır / sola kır / geri çık
+- Sensör verisini (telemetri) alabilir
+- İleride vision / yol planlama eklenebilir
+
+AUTO çıktısı:
+- hedef throttle (thr_auto)
+- hedef steer    (ste_auto)
+
+--------------------------
+1.2 LOW-LEVEL (Pico)
+--------------------------
+- Motor + servo PWM üretir
+- Fail-safe uygular
+- ASSIST mod güvenlik limitleri
+- AUTO modda da en son güvenlik otoritesi Pico’dadır
+
+KURAL:
+- Pico güvenlikten ödün vermez.
+- Pi yanlış komut yollasa bile Pico riskli davranışı engeller.
+
+==================================================
+2) MODLAR (MANUAL / ASSIST / AUTO) ve OVERRIDE
+==================================================
+
+Mode kaynakları:
+- PC klavyesi (1/2/3) temel seçici
+- AUTO seçildiyse Pi kontrol eder
+- Her zaman:
+  - ESC = E-STOP (kilit)
+  - SPACE = deadman (hareket izni)
+  - Timeout = STOP
+
+Override mantığı:
+- AUTO modda bile kullanıcı SPACE bırakırsa STOP
+- AUTO modda bile kullanıcı ESC basarsa STOP (latched)
+- AUTO modda kullanıcı MANUAL’a dönerse anında manuel kontrol
+
+==================================================
+3) İLETİŞİM YAPISI (AUTO İÇİN)
+==================================================
+
+AUTO için iki akış gerekir:
+
+A) PC → Pi (UDP): kullanıcı tuşları + mode + flags
+B) Pi → Pico (USB Serial): seçilen moda göre “son komut”
+
+Pi 4 bridge (köprü) artık iki kaynaktan komut üretir:
+- MANUAL/ASSIST: PC’den gelen thr/ste
+- AUTO: Pi’nin FSM çıktısı thr_auto/ste_auto
+
+Pico’ya giden tek gerçek komut:
+SET thr ste mode flags seq
+
+==================================================
+4) AUTO FSM (DURUM MAKİNESİ) TASARIMI
+==================================================
+
+Temel state’ler (minimum viable):
+
+- IDLE
+  - deadman yoksa burada bekler
+  - AUTO seçilse bile hareket yok
+- FORWARD
+  - ileri sür
+- SLOW
+  - engel yaklaşınca yavaşla
+- STOP
+  - kritik mesafede dur
+- AVOID_LEFT
+  - sola kır + yavaş ileri
+- AVOID_RIGHT
+  - sağa kır + yavaş ileri
+- REVERSE_ESCAPE
+  - çok sıkışınca kısa geri çık
+- RECOVER_CENTER
+  - direksiyonu merkeze al, tekrar FORWARD’a dön
+
+FSM girişleri:
+- dist_cm (HC-SR04)
+- imu_shock (MPU6050 eşik)
+- timer / süreler
+- kullanıcı override (deadman/estop/mode)
+
+==================================================
+5) FSM GEÇİŞ KURALLARI (ÖNERİLEN)
+==================================================
+
+Eşikler (cm):
+- CLEAR_DIST = 80
+- SLOW_DIST  = 60
+- STOP_DIST  = 25
+
+Kurallar:
+
+IDLE:
+- deadman && mode==AUTO → FORWARD
+- else stay
+
+FORWARD:
+- dist < SLOW_DIST → SLOW
+- dist < STOP_DIST → STOP
+
+SLOW:
+- dist < STOP_DIST → STOP
+- dist > CLEAR_DIST → FORWARD
+
+STOP:
+- dist > CLEAR_DIST → FORWARD
+- (eğer 2 saniye STOP’ta kalırsa) → AVOID_LEFT (veya RIGHT)
+
+AVOID_LEFT / AVOID_RIGHT:
+- belirli süre (örn 1.0s) steer + düşük throttle
+- dist > CLEAR_DIST → RECOVER_CENTER
+- dist çok düşük kalırsa → REVERSE_ESCAPE
+
+REVERSE_ESCAPE:
+- 0.5s geri + steer center
+- sonra RECOVER_CENTER
+
+RECOVER_CENTER:
+- steer=0 kısa süre
+- FORWARD’a dön
+
+==================================================
+6) AUTO ÇIKTILARI (THROTTLE/STEER PROFİLLERİ)
+==================================================
+
+Önerilen sabit değerler (başlangıç):
+
+FORWARD:
+- thr = +400
+- ste = 0
+
+SLOW:
+- thr = +200
+- ste = 0
+
+STOP:
+- thr = 0
+- ste = 0
+
+AVOID_LEFT:
+- thr = +180
+- ste = -700
+
+AVOID_RIGHT:
+- thr = +180
+- ste = +700
+
+REVERSE_ESCAPE:
+- thr = -200
+- ste = 0
+
+RECOVER_CENTER:
+- thr = 0
+- ste = 0
+
+NOT:
+- Pico tarafında ramp zaten var → bu değerler “hedef” gibi düşünülür.
+
+==================================================
+7) PICO GÜVENLİK KATMANI (AUTO İÇİN DE GEÇERLİ)
+==================================================
+
+Pico’da değişmeyen kurallar:
+
+- estop → motor=0, servo=center
+- deadman yok → motor=0
+- timeout → motor=0
+- assist limit (engel çok yakınsa) → motor=0
+- limitler (THR_LIMIT, servo limitleri) → her zaman aktif
+
+Bu sayede:
+- AUTO mantığı hata yapsa bile araç güvenli kalır.
+
+==================================================
+8) UYGULAMA ADIMLARI (AŞAMA H)
+==================================================
+
+H.1) Protokolü finalize et:
+- PC → Pi: thr,ste,mode,flags,seq
+- Pi → Pico: SET thr ste mode flags seq
+
+H.2) Pi üzerinde “FSM runner” yaz:
+- dist bilgisi Pico’dan gelebilir (telemetri)
+- veya sensör Pi’de de olabilir (ama öneri: sensör Pico’da)
+
+H.3) Pi bridge’i güncelle:
+- AUTO modda: PC’den gelen thr/ste yerine FSM thr_auto/ste_auto kullan
+
+H.4) Pico main.py güncelle:
+- mode==AUTO ise gelen thr/ste komutlarını uygula
+- ama failsafe/assist limitleri yine devrede
+
+==================================================
+9) CHECKPOINT (AUTO ÇALIŞIYOR MU?)
+==================================================
+
+1) Aracı havada test et
+2) AUTO seç (PC’de 3)
+3) SPACE basılıyken:
+   - dist büyükse FORWARD
+4) Engel yaklaştır:
+   - SLOW → STOP tetiklenmeli
+5) Engel çek:
+   - FORWARD’a dönmeli
+6) ESC:
+   - her durumda E-STOP olmalı
+7) Wi-Fi koparıp test et:
+   - timeout ile STOP olmalı
+
+==================================================
+10) SONRAKİ ADIMLAR (İLERİ SEVİYE)
+==================================================
+
+- Vision tabanlı yönlendirme (Pi kamera)
+- Yol planlama
+- PID direksiyon düzeltme
+- IMU tabanlı yönelim filtresi (complementary/Kalman)
+- Telemtri logging (CSV + timestamps)
+
+==================================================
+
+==================================================
+AŞAMA H.1 — AUTO (FSM) KODUNA GEÇİŞ
+PROTOKOL GÜNCELLEME + PI BRIDGE İÇİNE AUTO FSM
+==================================================
+
+Bu adımda “AUTO mod”u gerçekten çalıştıracak minimum sistemi kuruyoruz.
+
+Ne yapıyoruz?
+1) Pi → Pico komut formatını güncelliyoruz:
+   ESKİ : SET thr ste flags seq
+   YENİ : SET thr ste mode flags seq
+
+2) Pi tarafında tek bir “master bridge” scripti çalışacak:
+   - PC’den UDP paketlerini alacak
+   - Pico’ya USB serial ile komut basacak
+   - Pico’dan telemetri okuyacak (mesafe)
+   - mode==AUTO iken thr/ste’yi PC’den değil, FSM’den üretecek
+
+3) Pico main.py:
+   - SET komutunu (mode dahil) parse edecek
+   - (opsiyon) HC-SR04 mesafeyi okuyup “TEL DIST=..” şeklinde Pi’ye yazacak
+   - Fail-safe yine Pico’da kalacak
+
+==================================================
+0) CHECKLIST (BAŞLAMADAN)
+==================================================
+
+- AŞAMA A (AP) OK
+- AŞAMA B (PC WASD) OK (pc_controller.py)
+- AŞAMA C (Pi UDP→Pico) OK
+- AŞAMA D (Pico motor+servo) OK
+- Şimdi AUTO için:
+  - Pico’da HC-SR04 bağlıysa dist telemetri gelir (önerilen)
+  - Bağlı değilse dist = NA kalır, AUTO sadece “STOP”ta kalacak (güvenli)
+
+==================================================
+1) PC (WASD) SCRIPT — DEĞİŞİKLİK VAR MI?
+==================================================
+
+PC tarafında zaten paket formatı:
+thr,ste,mode,flags,seq
+
+Yani PC kodu (pc_controller.py) değişmeden kalabilir.
+(Sadece PI_IP=192.168.4.1 ve port=9000 doğru olmalı.)
+
+==================================================
+2) PI TARAFI — YENİ MASTER BRIDGE (AUTO FSM İÇERİR)
+==================================================
+
+Pi 4 üzerinde şu dosyayı oluştur:
+
+nano ~/pi_master_bridge.py
+
+Aşağıdaki kodu olduğu gibi yapıştır:
+
+```python
+import socket
+import serial
+import time
+
+# =========================
+# UDP (PC -> Pi)
+# =========================
+UDP_IP = "0.0.0.0"
+UDP_PORT = 9000
+
+# =========================
+# SERIAL (Pi -> Pico)
+# =========================
+SERIAL_PORT = "/dev/ttyACM0"
+BAUDRATE = 115200
+
+# =========================
+# TIMEOUTS
+# =========================
+UDP_TIMEOUT = 0.25     # PC paketi gelmezse STOP
+TEL_TIMEOUT = 1.00     # Pico telemetri gelmezse dist=NA
+
+# =========================
+# AUTO FSM THR/STE AYARLARI
+# =========================
+CLEAR_DIST = 80.0
+SLOW_DIST  = 60.0
+STOP_DIST  = 25.0
+
+AUTO_THR_FWD   = 400
+AUTO_THR_SLOW  = 200
+AUTO_THR_REV   = -200
+AUTO_STE_LEFT  = -700
+AUTO_STE_RIGHT =  700
+
+# FSM zamanları
+AVOID_TIME_S   = 1.0
+REVERSE_TIME_S = 0.5
+STOP_WAIT_S    = 2.0
+
+# MODE
+MODE_MANUAL = 0
+MODE_ASSIST = 1
+MODE_AUTO   = 2
+
+# FSM states
+IDLE = "IDLE"
+FORWARD = "FORWARD"
+SLOW = "SLOW"
+STOP = "STOP"
+AVOID_LEFT = "AVOID_LEFT"
+AVOID_RIGHT = "AVOID_RIGHT"
+REVERSE_ESCAPE = "REVERSE_ESCAPE"
+RECOVER = "RECOVER"
+
+# =========================
+# SOCKET + SERIAL SETUP
+# =========================
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.setblocking(False)
+
+ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.02)
+time.sleep(2)
+
+print("PI MASTER BRIDGE STARTED")
+print("UDP:", UDP_PORT, "| SERIAL:", SERIAL_PORT)
+
+# =========================
+# STATE
+# =========================
+last_udp_time = time.time()
+last_tel_time = 0.0
+
+pc_thr = 0
+pc_ste = 0
+pc_mode = MODE_MANUAL
+pc_flags = 0
+pc_seq = 0
+
+dist_cm = None
+
+fsm_state = IDLE
+fsm_t0 = time.time()
+last_stop_enter = 0.0
+
+def now():
+    return time.time()
+
+def send_pico(thr, ste, mode, flags, seq):
+    cmd = f"SET {thr} {ste} {mode} {flags} {seq}\n"
+    ser.write(cmd.encode())
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def parse_pc_packet(msg):
+    # msg: "thr,ste,mode,flags,seq"
+    parts = msg.split(",")
+    if len(parts) != 5:
+        return None
+    try:
+        thr = int(parts[0])
+        ste = int(parts[1])
+        mode = int(parts[2])
+        flags = int(parts[3])
+        seq = int(parts[4])
+        return thr, ste, mode, flags, seq
+    except:
+        return None
+
+def read_telemetry():
+    # Pico stdout -> Pi serial RX
+    # Beklenen format: "TEL DIST=xx.x"
+    global dist_cm, last_tel_time
+    try:
+        line = ser.readline()
+        if not line:
+            return
+        s = line.decode(errors="replace").strip()
+        if s.startswith("TEL "):
+            # ör: TEL DIST=34.5
+            if "DIST=" in s:
+                v = s.split("DIST=")[-1].strip()
+                try:
+                    dist_cm = float(v)
+                    last_tel_time = now()
+                except:
+                    pass
+    except:
+        pass
+
+def flags_bits(flags):
+    deadman = (flags & (1 << 1)) != 0
+    estop   = (flags & (1 << 2)) != 0
+    brake   = (flags & (1 << 3)) != 0
+    hold    = (flags & (1 << 4)) != 0
+    return deadman, estop, brake, hold
+
+def dist_valid():
+    if dist_cm is None:
+        return False
+    if now() - last_tel_time > TEL_TIMEOUT:
+        return False
+    return True
+
+def auto_fsm_step(flags):
+    # AUTO thr/ste üretir (minimum viable)
+    global fsm_state, fsm_t0, last_stop_enter
+
+    deadman, estop, brake, hold = flags_bits(flags)
+
+    # Üst güvenlik: E-STOP / deadman yok / brake / hold -> IDLE + stop
+    if estop or (not deadman) or brake or hold:
+        fsm_state = IDLE
+        fsm_t0 = now()
+        return 0, 0
+
+    # Mesafe yoksa güvenli davran: STOP
+    if not dist_valid():
+        fsm_state = STOP
+        return 0, 0
+
+    d = dist_cm
+
+    # Histerezis ve zamanlı kaçış
+    t = now()
+
+    if fsm_state == IDLE:
+        fsm_state = FORWARD
+        fsm_t0 = t
+        return AUTO_THR_FWD, 0
+
+    if fsm_state == FORWARD:
+        if d < STOP_DIST:
+            fsm_state = STOP
+            last_stop_enter = t
+            return 0, 0
+        if d < SLOW_DIST:
+            fsm_state = SLOW
+            fsm_t0 = t
+            return AUTO_THR_SLOW, 0
+        return AUTO_THR_FWD, 0
+
+    if fsm_state == SLOW:
+        if d < STOP_DIST:
+            fsm_state = STOP
+            last_stop_enter = t
+            return 0, 0
+        if d > CLEAR_DIST:
+            fsm_state = FORWARD
+            fsm_t0 = t
+            return AUTO_THR_FWD, 0
+        return AUTO_THR_SLOW, 0
+
+    if fsm_state == STOP:
+        # STOP'ta uzun kaldıysa kaçış manevrası başlat
+        if d > CLEAR_DIST:
+            fsm_state = FORWARD
+            fsm_t0 = t
+            return AUTO_THR_FWD, 0
+
+        if (t - last_stop_enter) > STOP_WAIT_S:
+            # basit seçim: önce sola dene
+            fsm_state = AVOID_LEFT
+            fsm_t0 = t
+            return AUTO_THR_SLOW, AUTO_STE_LEFT
+
+        return 0, 0
+
+    if fsm_state == AVOID_LEFT:
+        if d > CLEAR_DIST:
+            fsm_state = RECOVER
+            fsm_t0 = t
+            return 0, 0
+        if (t - fsm_t0) > AVOID_TIME_S:
+            fsm_state = REVERSE_ESCAPE
+            fsm_t0 = t
+            return AUTO_THR_REV, 0
+        return AUTO_THR_SLOW, AUTO_STE_LEFT
+
+    if fsm_state == AVOID_RIGHT:
+        if d > CLEAR_DIST:
+            fsm_state = RECOVER
+            fsm_t0 = t
+            return 0, 0
+        if (t - fsm_t0) > AVOID_TIME_S:
+            fsm_state = REVERSE_ESCAPE
+            fsm_t0 = t
+            return AUTO_THR_REV, 0
+        return AUTO_THR_SLOW, AUTO_STE_RIGHT
+
+    if fsm_state == REVERSE_ESCAPE:
+        if (t - fsm_t0) > REVERSE_TIME_S:
+            fsm_state = RECOVER
+            fsm_t0 = t
+            return 0, 0
+        return AUTO_THR_REV, 0
+
+    if fsm_state == RECOVER:
+        # direksiyon ortala kısa süre sonra forward
+        if (t - fsm_t0) > 0.3:
+            fsm_state = FORWARD
+            fsm_t0 = t
+            return AUTO_THR_FWD, 0
+        return 0, 0
+
+    # default
+    fsm_state = IDLE
+    fsm_t0 = t
+    return 0, 0
+
+# =========================
+# MAIN LOOP
+# =========================
+while True:
+    # 1) Telemetri oku
+    read_telemetry()
+
+    # 2) PC UDP paket al
+    try:
+        data, addr = sock.recvfrom(1024)
+        msg = data.decode(errors="replace").strip()
+        parsed = parse_pc_packet(msg)
+        if parsed:
+            pc_thr, pc_ste, pc_mode, pc_flags, pc_seq = parsed
+            last_udp_time = now()
+    except BlockingIOError:
+        pass
+    except:
+        pass
+
+    # 3) UDP timeout -> STOP komutu
+    if now() - last_udp_time > UDP_TIMEOUT:
+        send_pico(0, 0, MODE_MANUAL, 0, 0)
+        time.sleep(0.01)
+        continue
+
+    # 4) MODE'a göre thr/ste seç
+    deadman, estop, brake, hold = flags_bits(pc_flags)
+
+    if pc_mode == MODE_AUTO:
+        out_thr, out_ste = auto_fsm_step(pc_flags)
+        # güvenli clamp
+        out_thr = clamp(out_thr, -1000, 1000)
+        out_ste = clamp(out_ste, -1000, 1000)
+        send_pico(out_thr, out_ste, MODE_AUTO, pc_flags, pc_seq)
+    else:
+        # MANUAL veya ASSIST: PC çıktısını aynen geçir
+        out_thr = clamp(pc_thr, -1000, 1000)
+        out_ste = clamp(pc_ste, -1000, 1000)
+        send_pico(out_thr, out_ste, pc_mode, pc_flags, pc_seq)
+
+    time.sleep(0.01)
+Kaydet/çık:
+
+- Ctrl+O Enter
+
+- Ctrl+X
+
+Çalıştır:
+
+```bash
+python3 ~/pi_master_bridge.py
+
+==================================================
+3) PICO main.py — PROTOKOL GÜNCELLEME (MODE EKLENDİ)
+
+Pico’da parse edilen SET formatını güncelleyeceğiz:
+SET thr ste mode flags seq
+
+AŞAMA D’deki main.py içinde şu iki değişiklik yapılır:
+
+(1) parse_set() artık 6 parça bekler
+(2) komut alındığında mode’u da okur (şimdilik sadece saklarız)
+
+ÖRNEK patch mantığı:
+
+Eski:
+if len(parts)!=5: ...
+thr=int(parts[1]); ste=int(parts[2]); flg=int(parts[3]); seq=int(parts[4])
+
+Yeni:
+if len(parts)!=6: ...
+thr=int(parts[1]); ste=int(parts[2]); mode=int(parts[3]); flg=int(parts[4]); seq=int(parts[5])
+
+NOT:
+
+Pico tarafında AUTO/MANUAL ayrımı zorunlu değil; Pi zaten thr/ste üretiyor.
+
+Ama mode’u almak iyi: log ve gelecekte “AUTO davranışı” için.
+
+==================================================
+4) (OPSİYONEL AMA ÖNERİLEN) PICO — HC-SR04 TELEMETRİ (TEL DIST=..)
+
+AUTO FSM’in “engel algısı” için mesafeyi Pi’ye taşımamız lazım.
+En hızlı yol: Pico mesafeyi ölçsün ve USB serial’e yazsın.
+
+Pico main.py içine, loop içinde 10Hz şöyle bir print eklenir:
+
+print("TEL DIST=34.5")
+
+Bu print’ler Pi master bridge tarafından okunur ve dist_cm güncellenir.
+
+HC-SR04 yoksa:
+
+TEL gelmez → dist_valid() false olur → AUTO güvenli şekilde STOP’ta kalır.
+
+==================================================
+5) ÇALIŞTIRMA SIRASI (AUTO TEST)
+
+Pi AP açık (IKA_CONTROL)
+
+PC bu ağa bağlı
+
+Pico bağlı + main.py çalışıyor
+
+Pi:
+python3 ~/pi_master_bridge.py
+
+PC:
+python pc_controller.py
+
+PC’de:
+
+3 bas (AUTO)
+
+SPACE basılı tut (deadman)
+
+Engel mesafesini değiştir:
+
+uzaksa FORWARD/SLOW
+
+yakınsa STOP
+
+ESC (E-STOP) her koşulda durdurmalı
+
+==================================================
+6) CHECKPOINT (BU ADIM OK MU?)
+
+MANUAL (1) modunda:
+
+araç PC thr/ste ile sürülüyor
+
+ASSIST (2) modunda:
+
+şimdilik PC çıkışı geçer (ASSIST kuralları sonra eklenecek)
+
+AUTO (3) modunda:
+
+Pi FSM thr/ste üretiyor
+
+DIST telemetri varsa engel yaklaşınca yavaşlayıp duruyor
+
+SPACE bırakınca her modda STOP
+
+ESC E-STOP her modda STOP
+
+PC kapanınca 250ms içinde STOP (UDP timeout)
+
+==================================================
+7) SONRAKİ ADIM
+
+AŞAMA H.2:
+
+Pico’da HC-SR04 okumasını main.py’ye tam entegre etmek
+
+ASSIST kurallarını Pico’ya eklemek (AŞAMA G kodlaması)
+
+AUTO FSM’i genişletmek (sağ/sol seçim, daha iyi kaçış, IMU shock)
+
+==================================================
+
+==================================================
+AŞAMA H.2 — PICO’DA HC-SR04’Ü ANA KODA ENTEGRE ETME
++ TELEMETRİ (TEL DIST=..)
++ ASSIST (YARI OTONOM) KURALLARI (PICO TARAFINDA)
+==================================================
+
+Bu adımda Pico’nun main.py’si “final low-level controller” gibi davranır:
+
+1) Pi’den gelen komutları okur:
+   SET thr ste mode flags seq
+
+2) HC-SR04 ile mesafe ölçer (cm)
+
+3) TELEMETRİ basar:
+   TEL DIST=xx.x
+
+4) MODE=ASSIST iken çarpışma önleme uygular:
+   - STOP_DIST altı -> throttle=0
+   - SLOW_DIST altı -> throttle limitlenir
+   - CLEAR_DIST üstü -> normale döner
+
+5) Güvenlik sırası (değişmez):
+   E-STOP > Deadman > Timeout > Assist > Normal çıkış
+
+NOT:
+- HC-SR04 Echo 5V olabilir, Pico GPIO 3.3V toleranslıdır.
+  Echo hattına seviye düşürme şart (direnç bölücü / level shifter).
+
+==================================================
+1) HC-SR04 BAĞLANTI (ÖZET)
+==================================================
+
+HC-SR04 VCC  -> 5V
+HC-SR04 GND  -> GND (Pico ile ortak)
+HC-SR04 TRIG -> Pico GPIO (aşağıda HC_TRIG_PIN)
+HC-SR04 ECHO -> Pico GPIO (aşağıda HC_ECHO_PIN)  [SEVİYE DÜŞÜRME ŞART]
+
+==================================================
+2) PICO main.py — H.2 FINAL SÜRÜM
+==================================================
+
+Aşağıdaki kodu Pico’ya main.py olarak kaydet.
+
+- Pinleri kendi sistemine göre düzelt:
+  - SERVO pinleri
+  - Motor RPWM/LPWM pinleri
+  - HC_TRIG / HC_ECHO pinleri
+
+--------------------------------------------------
+```python
+import time
+import sys
+import uselect
+from machine import Pin, PWM
+import utime
+
+# ==================================================
+# 0) KENDİ PINLERİNİ BURADA DOLDUR
+# ==================================================
+
+# --- HC-SR04 ---
+HC_TRIG_PIN = 10   # TODO: kendi TRIG pinin
+HC_ECHO_PIN = 11   # TODO: kendi ECHO pinin (SEVİYE DÜŞÜRME ŞART)
+
+# --- SERVO PİNLERİ ---
+SERVO_LEFT_PIN  = 14   # TODO
+SERVO_RIGHT_PIN = 15   # TODO
+
+# --- MOTOR PİNLERİ (RPWM/LPWM) ---
+M1_RPWM, M1_LPWM = 2, 3    # TODO
+M2_RPWM, M2_LPWM = 4, 5    # TODO
+M3_RPWM, M3_LPWM = 6, 7    # TODO
+M4_RPWM, M4_LPWM = 8, 9    # TODO
+
+# ==================================================
+# 1) PARAMETRELER
+# ==================================================
+
+# --- Mode ---
+MODE_MANUAL = 0
+MODE_ASSIST = 1
+MODE_AUTO   = 2
+
+# --- Servo ---
+SERVO_FREQ = 50
+SERVO_CENTER_US = 1500
+SERVO_MIN_US = 1100
+SERVO_MAX_US = 1900
+TRIM_L_US = 0
+TRIM_R_US = 0
+STEER_US_PER_1000 = 300   # 1000 steer -> 300us (mekaniğe göre ayarla)
+
+# --- Motor ---
+MOTOR_PWM_FREQ = 20000
+THR_LIMIT = 600           # ilk testte düşük tut (300-600)
+RAMP_THR_STEP = 30
+RAMP_STE_STEP = 80
+LOOP_DT = 0.01
+
+# --- Failsafe ---
+CMD_TIMEOUT_S = 0.30
+
+# --- Assist (HC-SR04 eşikleri, cm) ---
+STOP_DIST_CM  = 25.0
+SLOW_DIST_CM  = 60.0
+CLEAR_DIST_CM = 80.0
+ASSIST_SLOW_THR_LIMIT = 250  # yavaş mod limiti
+
+# --- HC-SR04 ölçüm ---
+HCSR04_TIMEOUT_US = 30000      # 30ms ~ 5m max
+HCSR04_PERIOD_MS = 100         # 10Hz ölçüm
+TEL_PERIOD_MS = 100            # 10Hz telemetri
+
+# ==================================================
+# 2) YARDIMCI FONKSİYONLAR
+# ==================================================
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def ramp(cur, target, step):
+    if cur < target:
+        return min(cur + step, target)
+    if cur > target:
+        return max(cur - step, target)
+    return cur
+
+# ==================================================
+# 3) SERVO SETUP
+# ==================================================
+
+servoL = PWM(Pin(SERVO_LEFT_PIN))
+servoR = PWM(Pin(SERVO_RIGHT_PIN))
+servoL.freq(SERVO_FREQ)
+servoR.freq(SERVO_FREQ)
+
+def servo_write_us(pwm_obj, us):
+    pwm_obj.duty_ns(int(us * 1000))
+
+def set_steer(steer):
+    steer = clamp(steer, -1000, 1000)
+    delta = int((steer * STEER_US_PER_1000) / 1000)
+
+    left_us  = SERVO_CENTER_US + delta + TRIM_L_US
+    right_us = SERVO_CENTER_US - delta + TRIM_R_US
+
+    left_us  = clamp(left_us,  SERVO_MIN_US, SERVO_MAX_US)
+    right_us = clamp(right_us, SERVO_MIN_US, SERVO_MAX_US)
+
+    servo_write_us(servoL, left_us)
+    servo_write_us(servoR, right_us)
+
+# ==================================================
+# 4) MOTOR SETUP
+# ==================================================
+
+def make_pwm(pin_no):
+    p = PWM(Pin(pin_no))
+    p.freq(MOTOR_PWM_FREQ)
+    p.duty_u16(0)
+    return p
+
+m1_r = make_pwm(M1_RPWM); m1_l = make_pwm(M1_LPWM)
+m2_r = make_pwm(M2_RPWM); m2_l = make_pwm(M2_LPWM)
+m3_r = make_pwm(M3_RPWM); m3_l = make_pwm(M3_LPWM)
+m4_r = make_pwm(M4_RPWM); m4_l = make_pwm(M4_LPWM)
+
+motors = [(m1_r, m1_l), (m2_r, m2_l), (m3_r, m3_l), (m4_r, m4_l)]
+
+def motor_set_pair(pwm_r, pwm_l, throttle):
+    throttle = clamp(throttle, -1000, 1000)
+    duty = int(abs(throttle) * 65535 / 1000)
+
+    if throttle > 0:
+        pwm_r.duty_u16(duty)
+        pwm_l.duty_u16(0)
+    elif throttle < 0:
+        pwm_r.duty_u16(0)
+        pwm_l.duty_u16(duty)
+    else:
+        pwm_r.duty_u16(0)
+        pwm_l.duty_u16(0)
+
+def set_throttle_all(throttle):
+    for pr, pl in motors:
+        motor_set_pair(pr, pl, throttle)
+
+def stop_all():
+    set_throttle_all(0)
+    set_steer(0)
+
+# ==================================================
+# 5) HC-SR04 SETUP + OKUMA
+# ==================================================
+
+trig = Pin(HC_TRIG_PIN, Pin.OUT)
+echo = Pin(HC_ECHO_PIN, Pin.IN)
+
+def hcsr04_distance_cm(timeout_us=HCSR04_TIMEOUT_US):
+    # trig pulse
+    trig.value(0)
+    utime.sleep_us(2)
+    trig.value(1)
+    utime.sleep_us(10)
+    trig.value(0)
+
+    # echo start bekle
+    t0 = utime.ticks_us()
+    while echo.value() == 0:
+        if utime.ticks_diff(utime.ticks_us(), t0) > timeout_us:
+            return None
+
+    start = utime.ticks_us()
+
+    # echo end bekle
+    while echo.value() == 1:
+        if utime.ticks_diff(utime.ticks_us(), start) > timeout_us:
+            return None
+
+    end = utime.ticks_us()
+    dur = utime.ticks_diff(end, start)  # us
+    cm = (dur * 0.0343) / 2.0
+    return cm
+
+# ==================================================
+# 6) SERIAL KOMUT OKUMA (SET thr ste mode flags seq)
+# ==================================================
+
+poll = uselect.poll()
+poll.register(sys.stdin, uselect.POLLIN)
+
+def parse_set(line):
+    # "SET thr ste mode flags seq"
+    parts = line.strip().split()
+    if len(parts) != 6 or parts[0].upper() != "SET":
+        return None
+    try:
+        thr  = int(parts[1])
+        ste  = int(parts[2])
+        mode = int(parts[3])
+        flg  = int(parts[4])
+        seq  = int(parts[5])
+        return thr, ste, mode, flg, seq
+    except:
+        return None
+
+def flags_bits(flags):
+    deadman = (flags & (1 << 1)) != 0
+    estop   = (flags & (1 << 2)) != 0
+    brake   = (flags & (1 << 3)) != 0
+    hold    = (flags & (1 << 4)) != 0
+    return deadman, estop, brake, hold
+
+# ==================================================
+# 7) ASSIST LIMITER (PICO’DA)
+# ==================================================
+
+assist_state = "CLEAR"  # CLEAR / SLOW / STOP
+
+def assist_limit(thr_cmd, dist_cm):
+    # dist yoksa güvenli: STOP
+    global assist_state
+    if dist_cm is None:
+        assist_state = "STOP"
+        return 0
+
+    d = dist_cm
+
+    # Histerezisli durum geçişleri
+    if assist_state == "CLEAR":
+        if d <= STOP_DIST_CM:
+            assist_state = "STOP"
+        elif d <= SLOW_DIST_CM:
+            assist_state = "SLOW"
+
+    elif assist_state == "SLOW":
+        if d <= STOP_DIST_CM:
+            assist_state = "STOP"
+        elif d >= CLEAR_DIST_CM:
+            assist_state = "CLEAR"
+
+    elif assist_state == "STOP":
+        if d >= CLEAR_DIST_CM:
+            assist_state = "CLEAR"
+
+    # Çıkış üret
+    if assist_state == "STOP":
+        return 0
+    if assist_state == "SLOW":
+        # ileri komutlarını limitliyoruz; geri genelde serbest bırakılır
+        if thr_cmd > ASSIST_SLOW_THR_LIMIT:
+            return ASSIST_SLOW_THR_LIMIT
+        return thr_cmd
+    return thr_cmd
+
+# ==================================================
+# 8) MAIN LOOP
+# ==================================================
+
+print("PICO READY (main.py) | PROTO: SET thr ste mode flags seq")
+stop_all()
+
+target_thr = 0
+target_ste = 0
+cur_thr = 0
+cur_ste = 0
+
+last_cmd_ms = utime.ticks_ms()
+
+dist_cm = None
+last_hc_ms = utime.ticks_ms()
+last_tel_ms = utime.ticks_ms()
+
+buf = ""
+
+while True:
+    # ---- (A) HC-SR04 periyodik ölçüm ----
+    now_ms = utime.ticks_ms()
+    if utime.ticks_diff(now_ms, last_hc_ms) >= HCSR04_PERIOD_MS:
+        dist_cm = hcsr04_distance_cm()
+        last_hc_ms = now_ms
+
+    # ---- (B) Telemetri bas (Pi master bridge okuyacak) ----
+    if utime.ticks_diff(now_ms, last_tel_ms) >= TEL_PERIOD_MS:
+        if dist_cm is None:
+            print("TEL DIST=NA")
+        else:
+            print("TEL DIST={:.1f}".format(dist_cm))
+        last_tel_ms = now_ms
+
+    # ---- (C) Serial komut oku ----
+    if poll.poll(0):
+        ch = sys.stdin.read(1)
+        if ch in ("\n", "\r"):
+            line = buf
+            buf = ""
+            parsed = parse_set(line)
+            if parsed:
+                thr_in, ste_in, mode_in, flags_in, seq_in = parsed
+                last_cmd_ms = utime.ticks_ms()
+
+                deadman, estop, brake, hold = flags_bits(flags_in)
+
+                # 1) E-STOP
+                if estop:
+                    target_thr = 0
+                    target_ste = 0
+
+                else:
+                    # steer hedefi her zaman alınır (istersen deadman yokken center yap)
+                    target_ste = clamp(ste_in, -1000, 1000)
+
+                    # 2) Deadman / brake / hold => throttle 0
+                    if (not deadman) or brake or hold:
+                        target_thr = 0
+                    else:
+                        # hard limit
+                        thr_in = clamp(thr_in, -THR_LIMIT, THR_LIMIT)
+
+                        # 3) Assist modda çarpışma önleme
+                        if mode_in == MODE_ASSIST:
+                            thr_in = assist_limit(thr_in, dist_cm)
+
+                        # AUTO modda: Pi zaten FSM thr/ste üretir, burada sadece güvenlik/limit var
+                        # MANUAL modda: PC thr/ste geçer
+                        target_thr = thr_in
+            # parse değilse ignore
+        else:
+            buf += ch
+
+    # ---- (D) Timeout failsafe ----
+    dt_ms = utime.ticks_diff(utime.ticks_ms(), last_cmd_ms)
+    if dt_ms > int(CMD_TIMEOUT_S * 1000):
+        target_thr = 0
+        target_ste = 0
+
+    # ---- (E) Ramp + çıkış uygula ----
+    cur_thr = ramp(cur_thr, target_thr, RAMP_THR_STEP)
+    cur_ste = ramp(cur_ste, target_ste, RAMP_STE_STEP)
+
+    set_throttle_all(cur_thr)
+    set_steer(cur_ste)
+
+    time.sleep(LOOP_DT)
+==================================================
+3) PI MASTER BRIDGE’DE GEREKEN TEK ŞEY
+
+Pi master bridge (H.1’deki pi_master_bridge.py) zaten
+Pico’dan gelen:
+
+TEL DIST=xx.x
+
+satırını okuyacak şekilde yazılmıştı.
+
+Yapman gereken:
+
+- Pi’de pi_master_bridge.py çalışsın
+
+- Pico main.py bu telemetriyi bassın
+
+- AUTO FSM dist_cm ile çalışsın
+
+==================================================
+4) PI BRIDGE’İN PICO’YA GÖNDERDİĞİ FORMAT (ZORUNLU)
+
+Pi’nin Pico’ya artık şu formatta göndermesi şart:
+
+SET thr ste mode flags seq
+
+Eğer hala eski formatı yolluyorsan (5 alan), Pico parse etmeyecek.
+
+H.1’deki pi_master_bridge.py zaten bu formatı kullanıyor.
+Kullanacağın script:
+python3 ~/pi_master_bridge.py
+
+==================================================
+5) TEST SIRASI (H.2)
+
+1. Pico’yu tekerler havadayken çalıştır
+
+2. Pi:
+   python3 ~/pi_master_bridge.py
+
+3. PC:
+   python pc_controller.py
+
+MANUAL TEST:
+
+- 1 bas (MANUAL)
+
+- SPACE + W: motor dönmeli
+
+- A/D: servo dönmeli
+
+ASSIST TEST:
+
+- 2 bas (ASSIST)
+
+- SPACE + W: gider
+
+- HC-SR04 önüne el yaklaştır:
+
+   - <60cm: hız düşmeli
+
+   - <25cm: STOP olmalı
+
+   - 80cm: normale dönmeli
+
+AUTO TEST:
+
+- 3 bas (AUTO)
+
+- SPACE basılı:
+
+   - mesafe uzaksa FORWARD/SLOW
+
+   - mesafe yakınsa STOP
+
+- ESC her modda STOP (E-STOP)
+
+==================================================
+6) CHECKPOINT (BU AŞAMA OK MU?)
+
+- Pico “TEL DIST=..” basıyor
+
+- Pi master bridge dist’i alıyor (AUTO için)
+
+- ASSIST modda çarpışma önleme çalışıyor
+
+- Timeout/Deadman/E-STOP çalışıyor
+
+==================================================
+7) SONRAKİ AŞAMA
+
+- AŞAMA H.3 — AUTO FSM’i güçlendirme
+
+- Sağ/sol kaçış seçimi (avoid left/right)
+
+- IMU shock ile motor kesme
+
+- Gelişmiş hysteresis + timer tuning
+
+- Telemetri logging (Pi’de CSV)
+
+==================================================
+
+
+==================================================
+AŞAMA H.3 — AUTO FSM’İ GÜÇLENDİRME (V2)
+SAĞ/SOL SEÇİMİ + IMU SHOCK + LOGGING + TUNING
+==================================================
+
+Bu aşamada AUTO modu “gerçek sahaya daha uygun” hale getiriyoruz:
+
+1) Sağ/sol kaçış seçimi (avoid left/right)
+2) IMU shock tespiti (MPU6050) ile acil motor kesme
+3) Pi tarafında CSV logging (zaman, dist, state, thr, ste)
+4) Zamanlar ve eşikler için tuning rehberi
+
+Mimari:
+- Pico: sensör okur (HC-SR04 + MPU6050), ASSIST uygular, telemetri basar
+- Pi: telemetriyi okur, AUTO FSM’i çalıştırır, Pico’ya thr/ste yollar
+
+Bu adım için:
+- Pi master bridge güncellenecek (FSM + logging + IMU shock kullanımı)
+- Pico main.py küçük ek alacak (MPU6050 shock telemetrisi)
+
+==================================================
+1) TELEMETRİ PROTOKOLÜ (PICO → PI) V2
+==================================================
+
+Pico artık şu satırları basacak:
+
+TEL DIST=34.5
+TEL SHOCK=0   (0/1)
+TEL IMU=ax,ay,az,gx,gy,gz   (opsiyonel, ağır olabilir)
+
+Bu adımda minimum:
+- DIST
+- SHOCK
+
+yeterli.
+
+==================================================
+2) PICO main.py — MPU6050 SHOCK EKİ (PATCH)
+==================================================
+
+AŞAMA H.2’deki Pico main.py’ye şu ekleri yap:
+
+- I2C ile MPU6050 oku
+- Basit shock metriği çıkar
+- TEL SHOCK=1 bas
+
+Aşağıdaki “blok”u main.py’ye ekle:
+(1) Üst tarafa import:
+    from machine import I2C
+
+(2) PIN ve I2C setup (pinleri ayarla):
+    I2C_ID=0, SDA=GP0, SCL=GP1 örneği
+
+(3) Loop’ta 10Hz IMU oku ve shock üret
+
+--------------------------
+PICO IMU BLOĞU (KOPYALA)
+--------------------------
+
+```python
+from machine import I2C
+
+# --- MPU6050 I2C (PINLERİ AYARLA) ---
+I2C_ID = 0
+I2C_SDA = 0
+I2C_SCL = 1
+MPU_ADDR = 0x68
+
+i2c = I2C(I2C_ID, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=400000)
+
+def i2c_scan():
+    return i2c.scan()
+
+def mpu_write(reg, val):
+    i2c.writeto_mem(MPU_ADDR, reg, bytes([val]))
+
+def mpu_read(reg, n):
+    return i2c.readfrom_mem(MPU_ADDR, reg, n)
+
+def to_int16(msb, lsb):
+    v = (msb << 8) | lsb
+    return v - 65536 if v & 0x8000 else v
+
+def mpu_init():
+    # wake
+    mpu_write(0x6B, 0x00)
+    time.sleep_ms(50)
+
+def mpu_read_acc_gyro():
+    data = mpu_read(0x3B, 14)
+    ax = to_int16(data[0], data[1])
+    ay = to_int16(data[2], data[3])
+    az = to_int16(data[4], data[5])
+    gx = to_int16(data[8], data[9])
+    gy = to_int16(data[10], data[11])
+    gz = to_int16(data[12], data[13])
+    return ax, ay, az, gx, gy, gz
+
+imu_ok = False
+shock = 0
+
+# init once (startup)
+addrs = i2c_scan()
+if MPU_ADDR in addrs:
+    mpu_init()
+    imu_ok = True
+else:
+    imu_ok = False
+==================================================
+AŞAMA H.3 — AUTO FSM’İ GÜÇLENDİRME (V2)
+SAĞ/SOL SEÇİMİ + IMU SHOCK + LOGGING + TUNING
+==================================================
+
+Bu aşamada AUTO modu “gerçek sahaya daha uygun” hale getiriyoruz:
+
+1) Sağ/sol kaçış seçimi (avoid left/right)
+2) IMU shock tespiti (MPU6050) ile acil motor kesme
+3) Pi tarafında CSV logging (zaman, dist, state, thr, ste)
+4) Zamanlar ve eşikler için tuning rehberi
+
+Mimari:
+- Pico: sensör okur (HC-SR04 + MPU6050), ASSIST uygular, telemetri basar
+- Pi: telemetriyi okur, AUTO FSM’i çalıştırır, Pico’ya thr/ste yollar
+
+Bu adım için:
+- Pi master bridge güncellenecek (FSM + logging + IMU shock kullanımı)
+- Pico main.py küçük ek alacak (MPU6050 shock telemetrisi)
+
+==================================================
+1) TELEMETRİ PROTOKOLÜ (PICO → PI) V2
+==================================================
+
+Pico artık şu satırları basacak:
+
+TEL DIST=34.5
+TEL SHOCK=0   (0/1)
+TEL IMU=ax,ay,az,gx,gy,gz   (opsiyonel, ağır olabilir)
+
+Bu adımda minimum:
+- DIST
+- SHOCK
+
+yeterli.
+
+==================================================
+2) PICO main.py — MPU6050 SHOCK EKİ (PATCH)
+==================================================
+
+AŞAMA H.2’deki Pico main.py’ye şu ekleri yap:
+
+- I2C ile MPU6050 oku
+- Basit shock metriği çıkar
+- TEL SHOCK=1 bas
+
+Aşağıdaki “blok”u main.py’ye ekle:
+(1) Üst tarafa import:
+    from machine import I2C
+
+(2) PIN ve I2C setup (pinleri ayarla):
+    I2C_ID=0, SDA=GP0, SCL=GP1 örneği
+
+(3) Loop’ta 10Hz IMU oku ve shock üret
+
+--------------------------
+PICO IMU BLOĞU (KOPYALA)
+--------------------------
+
+```python
+from machine import I2C
+
+# --- MPU6050 I2C (PINLERİ AYARLA) ---
+I2C_ID = 0
+I2C_SDA = 0
+I2C_SCL = 1
+MPU_ADDR = 0x68
+
+i2c = I2C(I2C_ID, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=400000)
+
+def i2c_scan():
+    return i2c.scan()
+
+def mpu_write(reg, val):
+    i2c.writeto_mem(MPU_ADDR, reg, bytes([val]))
+
+def mpu_read(reg, n):
+    return i2c.readfrom_mem(MPU_ADDR, reg, n)
+
+def to_int16(msb, lsb):
+    v = (msb << 8) | lsb
+    return v - 65536 if v & 0x8000 else v
+
+def mpu_init():
+    # wake
+    mpu_write(0x6B, 0x00)
+    time.sleep_ms(50)
+
+def mpu_read_acc_gyro():
+    data = mpu_read(0x3B, 14)
+    ax = to_int16(data[0], data[1])
+    ay = to_int16(data[2], data[3])
+    az = to_int16(data[4], data[5])
+    gx = to_int16(data[8], data[9])
+    gy = to_int16(data[10], data[11])
+    gz = to_int16(data[12], data[13])
+    return ax, ay, az, gx, gy, gz
+
+imu_ok = False
+shock = 0
+
+# init once (startup)
+addrs = i2c_scan()
+if MPU_ADDR in addrs:
+    mpu_init()
+    imu_ok = True
+else:
+    imu_ok = False
+
+Loop içinde (telemetri basılan yerde) şu mantığı ekle:
+
+# --- IMU shock tespiti (10Hz) ---
+if imu_ok:
+    ax, ay, az, gx, gy, gz = mpu_read_acc_gyro()
+    # Basit shock metriği: |a| toplamı belli eşiği geçerse shock=1
+    # Eşik: deneyle ayarlanır. Başlangıç için 50000 iyi bir deneme.
+    a_metric = abs(ax) + abs(ay) + abs(az)
+    shock = 1 if a_metric > 50000 else 0
+else:
+    shock = 0
+
+
+Ve telemetri basarken şunu da bas:
+
+print("TEL SHOCK={}".format(shock))
+
+
+NOT:
+
+-vDaha iyi shock için gyro da dahil edilebilir.
+
+- Bu “minimum viable” koruma katmanıdır.
+
+==================================================
+3) PI MASTER BRIDGE — FSM V2 + LOGGING
+
+Pi’de yeni dosya oluştur:
+
+nano ~/pi_master_bridge_v2.py
+
+Aşağıdaki kodu yapıştır:
+
+import socket
+import serial
+import time
+import csv
+
+# =========================
+# UDP (PC -> Pi)
+# =========================
+UDP_IP = "0.0.0.0"
+UDP_PORT = 9000
+
+# =========================
+# SERIAL (Pi -> Pico)
+# =========================
+SERIAL_PORT = "/dev/ttyACM0"
+BAUDRATE = 115200
+
+# =========================
+# TIMEOUTS
+# =========================
+UDP_TIMEOUT = 0.25
+TEL_TIMEOUT = 1.00
+
+# =========================
+# DIST EŞİKLERİ (cm)
+# =========================
+CLEAR_DIST = 80.0
+SLOW_DIST  = 60.0
+STOP_DIST  = 25.0
+
+# =========================
+# AUTO PROFİLLER
+# =========================
+AUTO_THR_FWD   = 420
+AUTO_THR_SLOW  = 200
+AUTO_THR_REV   = -220
+AUTO_STE_LEFT  = -750
+AUTO_STE_RIGHT =  750
+
+AVOID_TIME_S   = 1.0
+REVERSE_TIME_S = 0.6
+STOP_WAIT_S    = 1.5
+RECOVER_TIME_S = 0.3
+
+MODE_MANUAL = 0
+MODE_ASSIST = 1
+MODE_AUTO   = 2
+
+IDLE="IDLE"
+FORWARD="FORWARD"
+SLOW="SLOW"
+STOP="STOP"
+AVOID_L="AVOID_L"
+AVOID_R="AVOID_R"
+REV="REV"
+RECOVER="RECOVER"
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.setblocking(False)
+
+ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.02)
+time.sleep(2)
+
+print("PI MASTER BRIDGE V2 STARTED")
+
+# ---- logging ----
+logf = open("ika_log.csv", "a", newline="")
+writer = csv.writer(logf)
+if logf.tell() == 0:
+    writer.writerow(["t","mode","state","dist_cm","shock","thr","ste","flags","seq"])
+
+# ---- state ----
+last_udp = time.time()
+pc_thr=0; pc_ste=0; pc_mode=0; pc_flags=0; pc_seq=0
+
+dist_cm=None
+shock=0
+last_tel=0.0
+
+fsm_state=IDLE
+state_t0=time.time()
+stop_enter=time.time()
+
+avoid_dir = "L"   # L / R dönüşümlü kaçış (memory)
+
+def now():
+    return time.time()
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def flags_bits(flags):
+    deadman = (flags & (1 << 1)) != 0
+    estop   = (flags & (1 << 2)) != 0
+    brake   = (flags & (1 << 3)) != 0
+    hold    = (flags & (1 << 4)) != 0
+    return deadman, estop, brake, hold
+
+def parse_pc(msg):
+    parts = msg.split(",")
+    if len(parts)!=5:
+        return None
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+    except:
+        return None
+
+def send_pico(thr, ste, mode, flags, seq):
+    cmd = f"SET {thr} {ste} {mode} {flags} {seq}\n"
+    ser.write(cmd.encode())
+
+def read_tel():
+    global dist_cm, shock, last_tel
+    try:
+        line = ser.readline()
+        if not line:
+            return
+        s = line.decode(errors="replace").strip()
+        if s.startswith("TEL "):
+            if "DIST=" in s:
+                v = s.split("DIST=")[-1].strip()
+                if v != "NA":
+                    try:
+                        dist_cm = float(v)
+                        last_tel = now()
+                    except:
+                        pass
+            elif "SHOCK=" in s:
+                v = s.split("SHOCK=")[-1].strip()
+                try:
+                    shock = int(v)
+                    last_tel = now()
+                except:
+                    pass
+    except:
+        pass
+
+def tel_ok():
+    return (dist_cm is not None) and ((now()-last_tel) < TEL_TIMEOUT)
+
+def auto_step(flags):
+    global fsm_state, state_t0, stop_enter, avoid_dir
+
+    deadman, estop, brake, hold = flags_bits(flags)
+
+    # üst güvenlik
+    if estop or (not deadman) or brake or hold:
+        fsm_state = IDLE
+        state_t0 = now()
+        return 0, 0
+
+    # shock olursa anlık kes
+    if shock == 1:
+        fsm_state = STOP
+        stop_enter = now()
+        return 0, 0
+
+    # telemetri yoksa güvenli stop
+    if not tel_ok():
+        fsm_state = STOP
+        stop_enter = now()
+        return 0, 0
+
+    d = dist_cm
+    t = now()
+
+    if fsm_state == IDLE:
+        fsm_state = FORWARD
+        state_t0 = t
+        return AUTO_THR_FWD, 0
+
+    if fsm_state == FORWARD:
+        if d <= STOP_DIST:
+            fsm_state = STOP; stop_enter = t
+            return 0, 0
+        if d <= SLOW_DIST:
+            fsm_state = SLOW; state_t0 = t
+            return AUTO_THR_SLOW, 0
+        return AUTO_THR_FWD, 0
+
+    if fsm_state == SLOW:
+        if d <= STOP_DIST:
+            fsm_state = STOP; stop_enter = t
+            return 0, 0
+        if d >= CLEAR_DIST:
+            fsm_state = FORWARD; state_t0 = t
+            return AUTO_THR_FWD, 0
+        return AUTO_THR_SLOW, 0
+
+    if fsm_state == STOP:
+        if d >= CLEAR_DIST and shock == 0:
+            fsm_state = FORWARD; state_t0 = t
+            return AUTO_THR_FWD, 0
+
+        # STOP’ta bekle, sonra kaçış dene
+        if (t - stop_enter) > STOP_WAIT_S:
+            if avoid_dir == "L":
+                fsm_state = AVOID_L; state_t0 = t
+                avoid_dir = "R"
+                return AUTO_THR_SLOW, AUTO_STE_LEFT
+            else:
+                fsm_state = AVOID_R; state_t0 = t
+                avoid_dir = "L"
+                return AUTO_THR_SLOW, AUTO_STE_RIGHT
+
+        return 0, 0
+
+    if fsm_state == AVOID_L:
+        if d >= CLEAR_DIST:
+            fsm_state = RECOVER; state_t0 = t
+            return 0, 0
+        if (t - state_t0) > AVOID_TIME_S:
+            fsm_state = REV; state_t0 = t
+            return AUTO_THR_REV, 0
+        return AUTO_THR_SLOW, AUTO_STE_LEFT
+
+    if fsm_state == AVOID_R:
+        if d >= CLEAR_DIST:
+            fsm_state = RECOVER; state_t0 = t
+            return 0, 0
+        if (t - state_t0) > AVOID_TIME_S:
+            fsm_state = REV; state_t0 = t
+            return AUTO_THR_REV, 0
+        return AUTO_THR_SLOW, AUTO_STE_RIGHT
+
+    if fsm_state == REV:
+        if (t - state_t0) > REVERSE_TIME_S:
+            fsm_state = RECOVER; state_t0 = t
+            return 0, 0
+        return AUTO_THR_REV, 0
+
+    if fsm_state == RECOVER:
+        if (t - state_t0) > RECOVER_TIME_S:
+            fsm_state = FORWARD; state_t0 = t
+            return AUTO_THR_FWD, 0
+        return 0, 0
+
+    fsm_state = IDLE; state_t0 = t
+    return 0, 0
+
+# ---- main loop ----
+while True:
+    # telemetri oku (satır satır)
+    read_tel()
+
+    # PC UDP al
+    try:
+        data, addr = sock.recvfrom(1024)
+        msg = data.decode(errors="replace").strip()
+        p = parse_pc(msg)
+        if p:
+            pc_thr, pc_ste, pc_mode, pc_flags, pc_seq = p
+            last_udp = now()
+    except BlockingIOError:
+        pass
+    except:
+        pass
+
+    # UDP timeout -> stop
+    if now() - last_udp > UDP_TIMEOUT:
+        send_pico(0, 0, MODE_MANUAL, 0, 0)
+        time.sleep(0.01)
+        continue
+
+    # mode seç
+    if pc_mode == MODE_AUTO:
+        out_thr, out_ste = auto_step(pc_flags)
+        out_thr = clamp(out_thr, -1000, 1000)
+        out_ste = clamp(out_ste, -1000, 1000)
+        send_pico(out_thr, out_ste, MODE_AUTO, pc_flags, pc_seq)
+        writer.writerow([now(), pc_mode, fsm_state, dist_cm, shock, out_thr, out_ste, pc_flags, pc_seq])
+        logf.flush()
+    else:
+        out_thr = clamp(pc_thr, -1000, 1000)
+        out_ste = clamp(pc_ste, -1000, 1000)
+        send_pico(out_thr, out_ste, pc_mode, pc_flags, pc_seq)
+        writer.writerow([now(), pc_mode, "PC", dist_cm, shock, out_thr, out_ste, pc_flags, pc_seq])
+        logf.flush()
+
+    time.sleep(0.01)
+
+
+Çalıştır:
+python3 ~/pi_master_bridge_v2.py
+
+Bu dosya aynı klasöre "ika_log.csv" logunu üretir.
+
+==================================================
+4) ÇALIŞTIRMA SIRASI (H.3)
+
+1. Pico main.py (H.2) + IMU patch ile çalışıyor olmalı
+
+  - TEL DIST=..
+
+  - TEL SHOCK=..
+
+2. Pi:
+   python3 ~/pi_master_bridge_v2.py
+
+3. PC:
+   python pc_controller.py
+
+4. AUTO testi:
+
+   3 (AUTO)
+
+   SPACE basılı
+
+   engel yaklaşınca SLOW/STOP
+
+   STOP’ta bekleyince AVOID_L / AVOID_R
+
+   shock olursa STOP
+
+==================================================
+5) CHECKPOINT (H.3 OK MU?)
+
+- Pi master bridge terminalde hatasız kalıyor
+
+- ika_log.csv oluşuyor ve satırlar doluyor
+
+- AUTO’da state geçişleri oluyor:
+  FORWARD -> SLOW -> STOP -> AVOID -> REV -> RECOVER -> FORWARD
+
+- SHOCK=1 olduğunda STOP’a geçiyor
+
+- ESC E-STOP her modda çalışıyor
+
+- UDP timeout (PC kapatınca) STOP gönderiyor
+
+==================================================
+6) TUNING (SAHAYA GÖRE AYAR)
+
+- Çok agresif kaçıyorsa:
+  AVOID_TIME_S düşür, AUTO_STE değerini düşür
+
+- Çok geç duruyorsa:
+  STOP_DIST artır (25->30)
+
+- Çok erken yavaşlıyorsa:
+  SLOW_DIST düşür (60->50)
+
+- Titreme varsa:
+  CLEAR_DIST yükselt (80->90) veya histerezisi genişlet
+
+- Shock çok hassassa:
+  a_metric eşiğini yükselt (50000->70000)
+
+==================================================
+7) SONRAKİ AŞAMA
+
+AŞAMA H.4 — Saha Dayanıklılığı
+
+- Scriptleri systemd servis yapmak (Pi’de otomatik başlasın)
+
+- Watchdog / auto-restart
+
+- CPU/RAM optimizasyon
+
+- Wi-Fi kanal / güç ayarı
+
+- Kayıtların döngüsel log (log rotate)
+
+==================================================
+
+
+==================================================
+AŞAMA H.4 — SAHA DAYANIKLILIĞI (PRODUCTION MODE)
+SYSTEMD SERVİS + AUTO-RESTART + WATCHDOG + OPTİMİZASYON
+==================================================
+
+Bu aşamada amaç:
+- Pi yeniden başlasa bile sistemin otomatik kalkması
+- Scriptlerin crash olsa bile yeniden başlaması
+- Sahada “elle terminal açıp çalıştırma” ihtiyacını minimize etmek
+- Logların düzenli tutulması (şişmesin)
+- Wi-Fi/AP stabilitesinin artırılması
+
+Bu adımda 2 servis yapacağız:
+1) pi_master_bridge servis (UDP+FSM+serial)
+2) (opsiyon) PC controller servis (PC tarafı; istersen sonra)
+
+==================================================
+0) DOSYA KONUMU ÖNERİSİ
+==================================================
+
+Pi’de tek klasör aç:
+
+mkdir -p ~/ika
+mv ~/pi_master_bridge_v2.py ~/ika/
+cd ~/ika
+
+(İstersen dosya adı sabit: pi_master_bridge.py olarak da bırakabilirsin.
+Ben v2 üzerinden gidiyorum.)
+
+==================================================
+1) PI MASTER BRIDGE’İ “UNBUFFERED” ÇALIŞTIRMA (ÖNEMLİ)
+==================================================
+
+Python stdout bazen buffer’lanır. systemd’de log gecikmesini önlemek için:
+
+python3 -u ~/ika/pi_master_bridge_v2.py
+
+Serviste de -u kullanacağız.
+
+==================================================
+2) SYSTEMD SERVİS DOSYASI (PI MASTER BRIDGE)
+==================================================
+
+Servis dosyası oluştur:
+
+sudo nano /etc/systemd/system/ika-bridge.service
+
+Aşağıdakini yapıştır:
+
+--------------------------------------------------
+```ini
+[Unit]
+Description=IKA Pi Master Bridge (UDP->Pico Serial + AUTO FSM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=temirbug
+WorkingDirectory=/home/temirbug/ika
+ExecStart=/usr/bin/python3 -u /home/temirbug/ika/pi_master_bridge_v2.py
+Restart=always
+RestartSec=1
+# USB serial ve ağ anlık gecikmelerine tolerans
+KillSignal=SIGINT
+TimeoutStopSec=2
+
+# Logları journal'a düşür
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+
+Not:
+
+- User=temirbug doğru.
+
+- WorkingDirectory doğru.
+
+- Dosya yolu doğru.
+
+==================================================
+3) SERVİSİ AKTİF ET ve ÇALIŞTIR
+
+sudo systemctl daemon-reload
+sudo systemctl enable ika-bridge.service
+sudo systemctl start ika-bridge.service
+
+Durum kontrol:
+sudo systemctl status ika-bridge.service
+
+Canlı log:
+journalctl -u ika-bridge.service -f
+
+==================================================
+4) USB SERIAL “PORT DEĞİŞİMİ”NE DAYANIKLILIK (ÖNERİ)
+
+Bazı durumlarda Pico /dev/ttyACM0 yerine /dev/ttyACM1 olabilir.
+Bunu sahada dert etmemek için 2 opsiyon:
+
+A) En hızlı çözüm:
+
+- Pi scriptinde SERIAL_PORT'u /dev/serial/by-id/... ile sabitlemek
+
+Portu bul:
+ls -l /dev/serial/by-id/
+
+Örnek gibi bir şey çıkar:
+usb-Raspberry_Pi_Pico_W_E660...-if00 -> ../../ttyACM0
+
+Scriptte:
+SERIAL_PORT = "/dev/serial/by-id/usb-Raspberry_Pi_Pico_W_....-if00"
+
+B) Alternatif:
+
+- Scriptte /dev/ttyACM* tarayıp ilkini seçmek
+  (sahada hızlı ama riskli; başka ACM cihazı bağlarsan karışır)
+
+ÖNERİ: /dev/serial/by-id en sağlamı.
+
+==================================================
+5) LOG DOSYASI ŞİŞMESİN (ROTATE)
+
+pi_master_bridge_v2.py "ika_log.csv" yazıyor.
+
+Sahada log büyür. 2 pratik seçenek:
+
+A) Günlük dosya adı:
+
+- dosya adı içine tarih ekle (en temiz)
+  B) logrotate ile otomatik döndür (production)
+
+LOGROTATE (B) için:
+
+sudo nano /etc/logrotate.d/ika-log
+
+İçeriği:
+
+/home/temirbug/ika/ika_log.csv {
+    size 5M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+
+
+Bu:
+
+- 5MB olunca döndürür
+
+- 5 tane yedek tutar
+
+- sıkıştırır
+
+==================================================
+6) WATCHDOG / HEALTH CHECK (MINIMAL)
+
+Saha için “koptu mu?” anlamak önemli.
+
+En basit health:
+
+- Script her 2 saniyede bir “HB” (heartbeat) log basar.
+
+pi_master_bridge_v2.py içine (opsiyonel):
+
+- loop’ta 2 saniyede bir:
+  print("HB", now(), "dist", dist_cm, "state", fsm_state)
+
+systemd restart zaten varsa çoğu crash’i toparlar.
+
+==================================================
+7) WI-FI / AP STABİLİTESİ (HIZLI AYARLAR)
+
+- Pi AP kanalını sabitle (1/6/11 gibi)
+
+- 2.4GHz kullan (saha menzili daha iyi)
+
+- Güç tasarrufu kapalı:
+sudo iw dev wlan0 set power_save off
+
+Kalıcı yapmak için rc.local veya systemd unit ile uygulanabilir.
+
+==================================================
+8) SAHADA ÇALIŞTIRMA AKIŞI (FINAL)
+
+1. Pi açılır
+
+ - ika-bridge.service otomatik başlar
+
+2. Pico USB bağlı olmalı
+
+3. PC IKA_CONTROL'a bağlanır
+
+4. PC’de sadece:
+   python pc_controller.py
+ 
+5. AUTO istenirse 3, ASSIST 2, MANUAL 1
+
+==================================================
+9) CHECKPOINT (H.4 OK MU?)
+
+- Pi reboot sonrası servis otomatik kalkıyor
+
+- journalctl -u ika-bridge.service -f ile log akıyor
+
+- PC bağlanınca araç tepki veriyor
+
+- PC kopunca STOP oluyor
+
+- Log dosyası döndürülüyor, şişmiyor
+
+==================================================
+10) SONRAKİ AŞAMA
+
+AŞAMA H.5 — PC TARAFINI DA SAHAYA HAZIR ETME
+
+- PC’de “tek tıkla başlat” (bat / powershell / desktop shortcut)
+
+- otomatik reconnect
+
+- tuş kilidi / focus / fullscreen güvenlik
+
+- (opsiyon) joystick/gamepad desteği (ucuz ve sağlam)
+
+==================================================

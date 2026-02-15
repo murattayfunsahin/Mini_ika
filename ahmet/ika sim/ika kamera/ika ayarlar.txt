@@ -1,0 +1,219 @@
+============================================================
+IKA – Raspberry Pi 4 Vision System
+SETUP & PROGRESS README
+============================================================
+
+Bu dosya, Raspberry Pi 4 üzerinde kurulan vision (görü tabanlı)
+sürüş sisteminde bugüne kadar yapılan TÜM işlemleri ve
+yeni bir SD karta Pi OS kurulduğunda sıfırdan nasıl ilerlenmesi
+gerektiğini adım adım özetler.
+
+------------------------------------------------------------
+1) DONANIM & TEMEL KABULLER
+------------------------------------------------------------
+- Cihaz: Raspberry Pi 4
+- Kamera: Raspberry Pi Camera (libcamera / Picamera2 destekli)
+- İşletim Sistemi: Raspberry Pi OS (64-bit önerilir)
+- Kullanıcı: temirbug
+- Proje dizini: /home/temirbug/ika
+
+------------------------------------------------------------
+2) PI OS KURULUMUNDAN SONRA YAPILAN GENEL İŞLEMLER
+------------------------------------------------------------
+
+2.1 Sistem güncelleme
+--------------------
+sudo apt update
+sudo apt full-upgrade -y
+sudo reboot
+
+2.2 Gerekli temel paketler
+--------------------------
+sudo apt install -y \
+  python3 \
+  python3-pip \
+  python3-venv \
+  git \
+  nano \
+  htop \
+  libatlas-base-dev \
+  libjpeg-dev \
+  libtiff-dev \
+  libopencv-dev \
+  tesseract-ocr
+
+2.3 Kamera altyapısı kontrolü
+-----------------------------
+libcamera-hello
+(libcamera preview geliyorsa kamera OK)
+
+------------------------------------------------------------
+3) PROJE DİZİN YAPISI
+------------------------------------------------------------
+
+/home/temirbug/ika
+│
+├── src/
+│   └── vision_brain.py        -> Ana vision algoritması
+│
+├── config/
+│   └── vision_config.json     -> Vision parametreleri
+│
+├── logs/
+│   ├── vision.log             -> Gerçek zamanlı kontrol çıktıları
+│   └── frames/
+│       ├── frame_*.jpg        -> Otomatik kaydedilen kamera görüntüleri
+│       └── mask_*.png         -> HSV + morphology sonrası maskeler
+│
+└── .venv/                     -> Python sanal ortam
+
+------------------------------------------------------------
+4) PYTHON SANAL ORTAM (ÇOK ÖNEMLİ)
+------------------------------------------------------------
+
+4.1 Sanal ortam oluşturma
+------------------------
+cd ~/ika
+python3 -m venv .venv
+
+4.2 Ortamı aktif etme
+---------------------
+source ~/ika/.venv/bin/activate
+
+4.3 Gerekli Python kütüphaneleri
+--------------------------------
+pip install --upgrade pip
+pip install numpy opencv-python picamera2
+
+------------------------------------------------------------
+5) VISION CONFIG (vision_config.json)
+------------------------------------------------------------
+
+Bu dosya, algoritmanın tamamını dışarıdan ayarlamayı sağlar.
+
+İçerik:
+- fps                 : Çalışma frekansı
+- roi_y, band_h       : Görüş bölgesi (yol bandı)
+- v_min, s_max        : HSV eşikleme
+- morph_k             : Gürültü temizleme
+- min_area_px         : Nesne algılama eşiği
+- conf_area_norm      : Güven (confidence) normalizasyonu
+- throttle / steer    : Hız & direksiyon sınırları
+- save_frames         : Ekran görüntüsü kaydı
+- save_every_n        : Kaç frame’de bir kayıt alınacağı
+
+Bu sayede:
+- Kod değiştirmeden ayar yapılır
+- Farklı pist / ışık koşulları kolayca test edilir
+
+------------------------------------------------------------
+6) VISION BRAIN (vision_brain.py) NE YAPIYOR?
+------------------------------------------------------------
+
+Ana akış:
+
+1. Kameradan frame alır (Picamera2)
+2. ROI (alt bölge) seçer
+3. HSV uzayında açık renkleri (zemin/yol) izole eder
+4. Morphology ile gürültüyü temizler
+5. En büyük bağlı bileşeni bulur
+6. Merkezden sapmaya göre:
+   - steer (direksiyon)
+   - throttle (hız)
+   - confidence (güven)
+   hesaplar
+7. EMA (exponential moving average) ile direksiyonu yumuşatır
+8. Vision çıktısını loglar
+9. Debug pencerelerini gösterir
+10. Belirli aralıklarla:
+    - Frame (jpg)
+    - Mask (png)
+    kaydeder
+
+------------------------------------------------------------
+7) vision.log NASIL ÇALIŞIYOR?
+------------------------------------------------------------
+
+Log formatı:
+V,<throttle>,<steer>,<confidence>
+
+Örnek:
+V,0.376,-0.925,0.293
+
+Anlamı:
+- throttle   : 0.0 – 1.0 arası hız
+- steer      : -1.0 (sol) ... +1.0 (sağ)
+- confidence : Görüş güveni
+
+Özel durumlar:
+- V,0.000,0.000,0.000
+  -> Kamera yol göremiyor / güven yok
+  -> Sistem güvenli duruş modunda
+
+Bu log:
+- Pico / motor kontrolüne gönderilecek ana veridir
+- Offline analiz için CSV gibi kullanılabilir
+
+------------------------------------------------------------
+8) EKRAN GÖRÜNTÜSÜ & LOGLAMA SİSTEMİ
+------------------------------------------------------------
+
+Başta sadece log alınıyordu.
+Sonrasında:
+
+- Otomatik frame kaydı eklendi
+- Mask görüntüleri de kaydediliyor
+- fps=20, save_every_n=20 → saniyede 1 görüntü
+
+Bu sayede:
+- Vision kararları görsel olarak doğrulanabiliyor
+- OCR / dataset / debug için arşiv oluşuyor
+
+------------------------------------------------------------
+9) OCR (TESSERACT) NE İÇİN?
+------------------------------------------------------------
+
+Amaç:
+- Kaydedilen frame’ler üzerinde
+- Yazı / numara / işaret okuma
+- İleri seviye görevler (plaka, tabela vb.)
+
+Kullanım örneği:
+tesseract frame_xxx.jpg out -l eng
+
+Not:
+OCR canlı çalışmıyor,
+loglanan görüntüler üzerinden çalışıyor.
+
+------------------------------------------------------------
+10) YENİ SD KART İÇİN CHECKLIST (ÖZET)
+------------------------------------------------------------
+
+[ ] Raspberry Pi OS (64-bit)
+[ ] Sistem update / upgrade
+[ ] Kamera test (libcamera-hello)
+[ ] python3 / pip / venv
+[ ] ~/ika dizin yapısı
+[ ] .venv oluşturma & aktif etme
+[ ] numpy, opencv, picamera2
+[ ] vision_config.json kopyalama
+[ ] vision_brain.py kopyalama
+[ ] İlk test: python vision_brain.py
+[ ] vision.log + frames kontrolü
+
+------------------------------------------------------------
+11) MEVCUT DURUM (ŞU AN)
+------------------------------------------------------------
+
+✔ Vision sistemi çalışıyor
+✔ Loglama stabil
+✔ Frame + mask kayıtları alınıyor
+✔ Işık/renk davranışı NORMAL
+✔ Algoritma debug edilebilir durumda
+
+SONRAKİ ADIM:
+- Vision → Pico seri haberleşme
+- Motor kontrol katmanı
+- Gerçek sürüş testleri
+
+============================================================

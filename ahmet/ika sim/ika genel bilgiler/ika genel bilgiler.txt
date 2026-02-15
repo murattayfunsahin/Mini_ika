@@ -1,0 +1,715 @@
+# İKA | Raspberry Pi 4 ↔ Raspberry Pi Pico W — Kurulum + Haberleşme + HC-SR04 + MPU-6050 + Motor/Servo Kontrol (TEK BLOK README)
+
+Bu README’yi tek seferde kopyalayıp yapıştırarak kullanabilirsin. İçindeki komutlar ve kodlar İKA için **sahada stabil** olacak şekilde seçildi.
+
+> KRİTİK: Pico MicroPython’da **yalnızca `main.py` otomatik çalışır.**  
+> `main_text.py` gibi isimler **auto-run değildir.** Çalışmasını istediğin dosya Pico içinde **mutlaka `main.py`** olmalıdır.
+
+---
+
+## 0) Mimari (Net)
+
+- **Raspberry Pi 4 (Pi):** Vision/algoritma, karar verme, log, network.
+- **Raspberry Pi Pico W (Pico):** Gerçek zamanlı I/O (PWM), sensör okuma, failsafe.
+- **Bağlantı:** USB Serial (CDC) → Pi’de `/dev/ttyACM*`
+- **Hedef:** Portu `/dev/pico_ika` gibi sabit bir isimle kullanmak.
+
+---
+
+## 1) Donanım Bağlantıları
+
+### 1.1 Pico W ↔ Pi
+- Pico’yu USB ile Pi’ye bağla.
+
+### 1.2 HC-SR04 (Ultrasonik) → Pico
+ÖNEMLİ: HC-SR04 Echo pini 5V verir, Pico GPIO 3.3V ister → **Echo için voltaj bölücü şart**.
+
+Önerilen bölücü:
+- Echo → 1k → (Pico Echo GPIO)
+- (Pico Echo GPIO) → 2k → GND
+
+Pin örneği:
+- HC-SR04 VCC → 5V (Pico VBUS veya harici 5V)
+- HC-SR04 GND → GND
+- TRIG → Pico GP14
+- ECHO → Pico GP15 (voltaj bölücü üzerinden!)
+
+### 1.3 MPU-6050 (IMU) → Pico (I2C)
+- VCC → 3V3
+- GND → GND
+- SDA → GP0
+- SCL → GP1
+- AD0 → GND (adres 0x68)
+
+---
+
+## 2) Pi (Raspberry Pi 4) Kurulum (Bir kere)
+
+### 2.1 Serial yetkisi
+```bash
+sudo usermod -aG dialout $USER
+Sonra logout/login (ya da reboot).
+
+###2.2 Paketler
+```bash
+sudo apt update
+sudo apt install -y python3-serial python3-venv
+
+###2.3 mpremote (Thonny sorunlarına karşı stabil dosya atma)
+```bash
+python3 -m venv ~/venv-mp
+source ~/venv-mp/bin/activate
+pip install --upgrade pip
+pip install mpremote
+mpremote --version
+
+###2.4 Portu sabitle (udev) — ŞART (ACM0/ACM1 değişmesin)
+
+Pico takılıyken portu gör:
+```bash
+ls -l /dev/ttyACM*
+
+Udev kuralı oluştur:
+```bash
+sudo nano /etc/udev/rules.d/99-pico-ika.rules
+İçine şunu yaz (Pico için tipik değerler; çalışmazsa udevadm info ile doğrularız):
+```bash
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", SYMLINK+="pico_ika"
+
+Uygula:
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+ls -l /dev/pico_ika
+
+Bundan sonra Pi’de port olarak /dev/pico_ika kullanacağız.
+
+##3) Pico Firmware (İKA’ya Özel) — PWM + Failsafe + Sensör Okuma + Telemetri
+
+###3.1 Dosya yapısı
+
+Pi üzerinde proje dizini:
+```bash
+mkdir -p ~/ika/pico ~/ika/pi ~/ika/logs
+
+###3.2 Pico main.py (İKA firmware) — ÖZEL KOD
+
+
+Bu firmware:
+
+	Komut alır (Pi → Pico):
+
+		PING → PONG
+
+		SET <thr_us> <steer_us> → PWM günceller + OK ...
+
+	Failsafe: 300ms komut gelmezse throttle nötr, steer orta
+
+	Sensör telemetri (Pico → Pi):
+
+		SENS dist_cm <...> ax ... gx ...
+
+	HC-SR04 + MPU-6050 entegre
+
+
+Pi üzerinde dosyayı yaz:
+
+```bash
+nano ~/ika/pico/main.py
+
+
+İçine yapıştır:
+
+```bash
+import time, sys
+import uselect
+from machine import Pin, PWM, I2C
+
+# =========================
+# 1) PWM (Servo / ESC)
+# =========================
+# İKA bağlantına göre değiştir:
+PWM_STEER_PIN = 16
+PWM_THROTTLE_PIN = 17
+
+pwm_steer = PWM(Pin(PWM_STEER_PIN))
+pwm_throttle = PWM(Pin(PWM_THROTTLE_PIN))
+pwm_steer.freq(50)
+pwm_throttle.freq(50)
+
+def us_to_duty_u16(us):
+    # 50Hz => 20ms => 20000us
+    return int(us * 65535 // 20000)
+
+STEER_CENTER = 1500
+STEER_MIN = 1000
+STEER_MAX = 2000
+
+THR_NEUTRAL = 1500
+THR_MIN = 1000
+THR_MAX = 2000
+
+def set_pwm(steer_us, thr_us):
+    steer_us = max(STEER_MIN, min(STEER_MAX, steer_us))
+    thr_us   = max(THR_MIN,   min(THR_MAX,   thr_us))
+    pwm_steer.duty_u16(us_to_duty_u16(steer_us))
+    pwm_throttle.duty_u16(us_to_duty_u16(thr_us))
+
+# Güvenli başlangıç
+set_pwm(STEER_CENTER, THR_NEUTRAL)
+
+# =========================
+# 2) FAILSAFE
+# =========================
+FAILSAFE_MS = 300
+last_cmd_ms = time.ticks_ms()
+
+def apply_failsafe_if_needed():
+    if time.ticks_diff(time.ticks_ms(), last_cmd_ms) > FAILSAFE_MS:
+        set_pwm(STEER_CENTER, THR_NEUTRAL)
+
+# =========================
+# 3) HC-SR04
+# =========================
+TRIG_PIN = 14
+ECHO_PIN = 15
+
+trig = Pin(TRIG_PIN, Pin.OUT)
+echo = Pin(ECHO_PIN, Pin.IN)
+
+def hcsr04_cm(timeout_us=30000):
+    trig.value(0); time.sleep_us(2)
+    trig.value(1); time.sleep_us(10)
+    trig.value(0)
+
+    t0 = time.ticks_us()
+    while echo.value() == 0:
+        if time.ticks_diff(time.ticks_us(), t0) > timeout_us:
+            return None
+
+    t1 = time.ticks_us()
+    while echo.value() == 1:
+        if time.ticks_diff(time.ticks_us(), t1) > timeout_us:
+            return None
+
+    dt = time.ticks_diff(time.ticks_us(), t1)
+    return dt / 58.0  # approx cm
+
+# =========================
+# 4) MPU-6050 (I2C)
+# =========================
+I2C_SDA = 0
+I2C_SCL = 1
+MPU_ADDR = 0x68
+
+i2c = I2C(0, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=400000)
+
+def mpu_write(reg, val):
+    i2c.writeto_mem(MPU_ADDR, reg, bytes([val]))
+
+def mpu_read(reg, n):
+    return i2c.readfrom_mem(MPU_ADDR, reg, n)
+
+def to_int16(msb, lsb):
+    v = (msb << 8) | lsb
+    if v & 0x8000:
+        v = -((65535 - v) + 1)
+    return v
+
+def mpu_init():
+    # Wake up
+    mpu_write(0x6B, 0x00)
+    time.sleep_ms(50)
+    # gyro ±250dps, accel ±2g
+    mpu_write(0x1B, 0x00)
+    mpu_write(0x1C, 0x00)
+
+def mpu_read_raw():
+    d = mpu_read(0x3B, 14)
+    ax = to_int16(d[0], d[1])
+    ay = to_int16(d[2], d[3])
+    az = to_int16(d[4], d[5])
+    temp = to_int16(d[6], d[7])
+    gx = to_int16(d[8], d[9])
+    gy = to_int16(d[10], d[11])
+    gz = to_int16(d[12], d[13])
+    return ax, ay, az, temp, gx, gy, gz
+
+mpu_ok = False
+try:
+    mpu_init()
+    mpu_ok = True
+except:
+    mpu_ok = False
+
+# =========================
+# 5) Serial Komut (non-blocking)
+# =========================
+poll = uselect.poll()
+poll.register(sys.stdin, uselect.POLLIN)
+
+buf = ""
+last_sens_ms = time.ticks_ms()
+
+print("PICO_IKA_READY mpu=", 1 if mpu_ok else 0)
+
+while True:
+    apply_failsafe_if_needed()
+
+    # ----- Komut al -----
+    if poll.poll(0):
+        ch = sys.stdin.read(1)
+        if ch:
+            if ch in ("\n", "\r"):
+                line = buf.strip()
+                buf = ""
+                if not line:
+                    continue
+                parts = line.split()
+
+                if parts[0] == "PING":
+                    print("PONG")
+                elif parts[0] == "SET" and len(parts) == 3:
+                    try:
+                        thr = int(parts[1])
+                        steer = int(parts[2])
+                        set_pwm(steer, thr)
+                        last_cmd_ms = time.ticks_ms()
+                        print("OK", thr, steer)
+                    except:
+                        print("ERR BAD_INT")
+                else:
+                    print("ERR BAD_CMD", line)
+            else:
+                buf += ch
+
+    # ----- Sensör telemetri (10Hz) -----
+    if time.ticks_diff(time.ticks_ms(), last_sens_ms) > 100:
+        last_sens_ms = time.ticks_ms()
+
+        dist = hcsr04_cm()
+        dist_str = "NaN" if dist is None else "{:.1f}".format(dist)
+
+        if mpu_ok:
+            ax, ay, az, temp, gx, gy, gz = mpu_read_raw()
+            print("SENS dist_cm", dist_str,
+                  "ax", ax, "ay", ay, "az", az,
+                  "gx", gx, "gy", gy, "gz", gz)
+        else:
+            print("SENS dist_cm", dist_str, "mpu", 0)
+
+    time.sleep(0.005)
+
+
+###3.3 Pico’ya yükle (auto-run için main.py)
+
+```bash
+source ~/venv-mp/bin/activate
+mpremote connect /dev/pico_ika fs cp ~/ika/pico/main.py :main.py
+mpremote connect /dev/pico_ika reset
+
+Eğer /dev/pico_ika yoksa /dev/ttyACM0 kullan.
+
+
+
+
+##4) Pi Tarafı (İKA Link) — Komut + Reconnect + CSV Log (ÖZEL KOD)
+
+Bu kod:
+
+	Pico’ya sürekli SET thr steer gönderir
+
+	PING/PONG ile bağlantıyı izler
+
+	SENS ... satırlarını parse edip CSV’ye yazar
+
+	Koparsa otomatik yeniden bağlanır
+
+Pi üzerinde dosya:
+
+```bash
+nano ~/ika/pi/ika_link.py
+
+İçine yapıştır:
+
+```bash
+import serial, time, csv, os
+
+PORT = "/dev/pico_ika"   # yoksa "/dev/ttyACM0"
+BAUD = 115200
+
+LOG_DIR = os.path.expanduser("~/ika/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+log_path = os.path.join(LOG_DIR, time.strftime("telemetry_%Y%m%d_%H%M%S.csv"))
+
+def connect():
+    while True:
+        try:
+            ser = serial.Serial(PORT, BAUD, timeout=0.1)
+            time.sleep(1.5)  # Pico reset olabilir
+            ser.reset_input_buffer()
+            print("CONNECTED", PORT)
+            return ser
+        except Exception as e:
+            print("WAIT_PORT", e)
+            time.sleep(1)
+
+def send_line(ser, s):
+    ser.write((s + "\n").encode())
+    ser.flush()
+
+def parse_keyvals(tokens):
+    # tokens: ["SENS","dist_cm","34.2","ax","123",...]
+    d = {}
+    i = 1
+    while i + 1 < len(tokens):
+        d[tokens[i]] = tokens[i+1]
+        i += 2
+    return d
+
+ser = connect()
+
+with open(log_path, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["t","type","thr_us","steer_us","dist_cm","ax","ay","az","gx","gy","gz","raw"])
+
+    last_ping = time.time()
+
+    # ====== İKA kontrol değerleri (şimdilik sabit) ======
+    # Vision çıkışını buraya bağlayacaksın.
+    thr = 1500     # ESC nötr. İleri/geri için 1400/1600 gibi oynatılır.
+    steer = 1500   # Servo center
+    # ====================================================
+
+    print("Logging to:", log_path)
+
+    while True:
+        try:
+            # 10Hz komut
+            send_line(ser, f"SET {thr} {steer}")
+
+            # 1Hz heartbeat
+            if time.time() - last_ping > 1.0:
+                send_line(ser, "PING")
+                last_ping = time.time()
+
+            line = ser.readline()
+            if line:
+                s = line.decode(errors="replace").strip()
+                t = time.time()
+
+                if s.startswith("SENS"):
+                    tokens = s.split()
+                    d = parse_keyvals(tokens)
+                    w.writerow([t,"SENS",thr,steer,d.get("dist_cm"),d.get("ax"),d.get("ay"),d.get("az"),
+                                d.get("gx"),d.get("gy"),d.get("gz"),s])
+                    f.flush()
+                else:
+                    # OK / PONG / ERR
+                    w.writerow([t,"MSG",thr,steer,"","","","","","","",s])
+                    f.flush()
+                    print("PICO>", s)
+
+            time.sleep(0.1)
+
+        except Exception as e:
+            print("DISCONNECTED", e)
+            try:
+                ser.close()
+            except:
+                pass
+            ser = connect()
+
+
+Çalıştır:
+
+```bash
+python3 ~/ika/pi/ika_link.py
+
+
+Beklenen:
+
+	Terminal: CONNECTED ... + PICO> PICO_IKA_READY ... + OK ... + PONG
+
+	~/ika/logs/telemetry_*.csv oluşur ve sensör satırları dolar.
+
+
+
+
+##5) Otomatik Başlat (Systemd) — Sahada şart
+
+Service dosyası:
+
+```bash
+sudo nano /etc/systemd/system/ika-link.service
+
+İçeriği (kullanıcı adın temirbug ise):
+
+```bash
+[Unit]
+Description=IKA Pico Link
+After=network.target
+
+[Service]
+User=temirbug
+WorkingDirectory=/home/temirbug
+ExecStart=/usr/bin/python3 /home/temirbug/ika/pi/ika_link.py
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+
+
+Aktifleştir:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ika-link.service
+sudo systemctl status ika-link.service
+
+Log izle:
+
+```bash
+journalctl -u ika-link.service -f
+
+
+
+
+##6) Hızlı Test & Debug Checklist (Takılınca buraya dön)
+
+###6.1) Pico portu var mı?
+
+```bash
+ls -l /dev/ttyACM* /dev/pico_ika
+
+###6.2) Portu kim tutuyor? (Thonny açık kalmasın)
+
+```bash
+sudo lsof /dev/ttyACM0
+
+###6.3) Pico’da main.py var mı?
+
+```bash
+source ~/venv-mp/bin/activate
+mpremote connect /dev/pico_ika fs ls
+
+###6.4)Unutma: Auto-run = main.py
+
+	Eğer dosya adını main_text.py yaptıysan Pico onu çalıştırmaz.
+
+	Çalıştırmak için:
+
+```bash
+mpremote connect /dev/pico_ika fs cp ~/ika/pico/main.py :main.py
+mpremote connect /dev/pico_ika reset
+
+
+
+
+##7) Vision/Algoritma Entegrasyonu (Senin taraf)
+
+~/ika/pi/ika_link.py içinde şu değişkenleri vision çıktınla besle:
+
+	thr (1000–2000 us)
+
+	steer (1000–2000 us)
+
+Öneri:
+
+	Normal sürüş: thr=1500 nötr, 1550–1650 ileri, 1450–1350 geri (ESC’ye göre değişir)
+
+	Engel algısı (HC-SR04):
+
+		dist_cm < 30 ise throttle’ı düşür veya 1500 yap.
+
+
+
+
+##8) Güvenlik Notları
+
+	HC-SR04 Echo 5V → bölücü şart (Pico GPIO’yu yakma).
+
+	Servo/ESC PWM için ortak GND şart.
+
+	Pi ağır yükte kasıyorsa Chromium kullanma; headless/SSH önerilir.
+
+
+
+
+###9) Dosya Yapısı
+
+
+~/ika/
+  pico/
+    main.py
+  pi/
+    ika_link.py
+  logs/
+    telemetry_*.csv
+
+
+
+==================================================
+SON DURUM DEĞERLENDİRMESİ ve KAPANIŞ (CHECKPOINT)
+==================================================
+
+Bu bölüm, Raspberry Pi 4 ↔ Raspberry Pi Pico W USB Serial haberleşme
+ve LED kontrolü çalışmalarının tamamlandığını belgelemek amacıyla
+README’ye eklenmiştir.
+
+Bu noktadan sonra konu bilinçli olarak kapatılmıştır ve İKA’nın
+bir sonraki safhasına geçilecektir.
+
+--------------------------------------------------
+1. SON DURUM ÖZETİ (ÇALIŞIYOR MU?)
+--------------------------------------------------
+
+Aşağıdaki maddelerin tamamı test edilmiş ve doğrulanmıştır:
+
+Pi 4 ↔ Pico W USB Serial:
+- Pico üzerinde MicroPython çalışıyor
+- Pico, Pi 4 tarafından `/dev/ttyACM0` üzerinden görülüyor
+- Pi 4’ten Pico’ya komut gönderilebiliyor (on / off)
+- Pico komutları doğru şekilde alıyor
+- Pico, Pi 4’e terminal çıktısı gönderebiliyor
+- USB CDC haberleşmesi stabil
+
+Pico tarafı:
+- `uselect.poll()` ile non-blocking input kullanılıyor
+- `sys.stdin.read(1)` ile karakter bazlı komut ayrıştırma çalışıyor
+- Sadece `main.py` dosyasının auto-run olduğu öğrenildi ve uygulandı
+- Kart farklarına karşı hem `"LED"` hem `GP25` destekleniyor
+- Kod sade, genişletilebilir ve debug edilebilir durumda
+
+Pi tarafı:
+- PEP 668 problemi çözüldü
+- Python sanal ortam (venv) kullanımı oturdu
+- `mpremote` ile Pico dosya sistemi yönetiliyor
+- `pyserial` ile USB serial iletişim stabil
+- Komut gönderme scripti (`pico_cmd.py`) çalışıyor
+
+Dokümantasyon:
+- Donanım yapısı net
+- Kurulum adımları eksiksiz
+- Thonny problemleri ve çözümleri yazıldı
+- `main.py` auto-run kuralı eklendi
+- Debug ve port kilitlenme notları mevcut
+
+SONUÇ:
+Bu aşama tamamen tamamlanmıştır.
+
+--------------------------------------------------
+2. SON KONTROL TESTLERİ (KAPANIŞ TESTİ)
+--------------------------------------------------
+
+Bu konu kapatılmadan önce aşağıdaki testler uygulanmıştır.
+
+Test 1 – Pico reset sonrası auto-run:
+Komut:
+mpremote connect /dev/ttyACM0 reset
+
+Beklenen:
+- Pico otomatik olarak başlar
+- Terminale `READY led_count=...` yazdırır
+
+Test 2 – Pi’den komut gönderme:
+Komut:
+python3 ~/pico/pico_cmd.py
+
+Beklenen:
+- Pico LED ON / OFF tepkisi verir
+- Terminal çıktıları düzgün görünür
+
+Test 3 – Port kilitlenmesi kontrolü:
+Komut:
+sudo lsof /dev/ttyACM0
+
+Beklenen:
+- Thonny kapalıyken port serbesttir
+
+Bu üç test başarılı olduğu için konu kapatılmıştır.
+
+--------------------------------------------------
+3. BİLİNÇLİ OLARAK YAPILMAYANLAR (EKSİK DEĞİL)
+--------------------------------------------------
+
+Aşağıdaki maddeler bilerek bu aşamada yapılmamıştır:
+
+- systemd servis oluşturulmadı
+- udev ile port sabitleme yapılmadı
+- binary protokol uygulanmadı
+- sensör okuma eklenmedi
+- motor / PWM kontrolü eklenmedi
+
+Bunlar eksik değildir; İKA safhasında ele alınacaktır.
+
+--------------------------------------------------
+4. BU AŞAMANIN KAZANIMI
+--------------------------------------------------
+
+Bu çalışma yalnızca LED yakma değildir.
+
+Kazanımlar:
+- USB CDC + MicroPython çalışma mantığı öğrenildi
+- Pico’nun yardımcı MCU rolü netleşti
+- Pi ↔ MCU mimarisi oturdu
+- Teknofest / robotik projeler için sağlam altyapı kuruldu
+- Debug kültürü ve hata ayıklama pratiği kazanıldı
+
+--------------------------------------------------
+5. BU KONUNUN KAPANIŞ KARARI
+--------------------------------------------------
+
+Bu README’nin bu bölümü itibarıyla:
+
+“Raspberry Pi 4 ↔ Raspberry Pi Pico W USB Serial haberleşme ve
+LED kontrolü” konusu TAMAMEN KAPATILMIŞTIR.
+
+Bu bölüme geri dönülmesi gerekmemektedir.
+
+--------------------------------------------------
+6. GELECEKTE BU KONUYA GERİ DÖNÜLDÜĞÜNDE
+   KONTROL EDİLECEKLER (HIZLI CHECKLIST)
+--------------------------------------------------
+
+İKA çalışmaları sırasında bu altyapıya tekrar ihtiyaç duyulursa,
+aşağıdaki kontroller sırasıyla yapılmalıdır:
+
+1) Pico bağlantısı:
+ls -l /dev/ttyACM*
+
+2) Portu kullanan program var mı?
+sudo lsof /dev/ttyACM0
+
+3) Pico’da hangi dosya auto-run?
+mpremote connect /dev/ttyACM0 fs ls
+- Çalışacak dosyanın adı `main.py` olmalı
+
+4) Pico reset sonrası çıktı geliyor mu?
+mpremote connect /dev/ttyACM0 reset
+
+5) Pi → Pico komut testi:
+python3 ~/pico/pico_cmd.py
+
+Bu kontroller geçiyorsa altyapı sağlamdır.
+
+--------------------------------------------------
+7. SONRAKİ SAFHA
+--------------------------------------------------
+
+Bu aşamadan sonra çalışma,
+İKA sistemine özel konulara taşınacaktır:
+
+- Motor / sürüş sistemi
+- Sensör entegrasyonu
+- Failsafe ve güvenlik mantığı
+- Otonom durum makineleri
+- Vision tabanlı kontrol
+
+==================================================
+
+
+
+
+

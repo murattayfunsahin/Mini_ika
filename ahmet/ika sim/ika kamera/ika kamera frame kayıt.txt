@@ -1,0 +1,182 @@
+# -*- coding: utf-8 -*-
+import json
+import time
+from pathlib import Path
+from collections import deque
+
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+
+HOME = Path.home()
+CONFIG_PATH = HOME / "ika" / "config" / "vision_config.json"
+
+def load_config():
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    # Expand paths
+    if "log_path" in cfg:
+        cfg["log_path"] = str(Path(cfg["log_path"]).expanduser())
+    if "frames_dir" in cfg:
+        cfg["frames_dir"] = str(Path(cfg["frames_dir"]).expanduser())
+
+    return cfg
+
+def init_camera():
+    cam = Picamera2()
+    cfg = cam.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+    cam.configure(cfg)
+    cam.start()
+    return cam
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def process_frame_to_command(frame, cfg):
+    h, w, _ = frame.shape
+    y0 = int(h * cfg.get("roi_y", 0.55))
+    roi = frame[y0:, :]
+
+    # HSV mask (white-ish / low saturation + high value)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+
+    v_min = int(cfg.get("v_min", 180))
+    s_max = int(cfg.get("s_max", 70))
+    lower = np.array([0, 0, v_min], dtype=np.uint8)
+    upper = np.array([180, s_max, 255], dtype=np.uint8)
+
+    bw = cv2.inRange(hsv, lower, upper)
+
+    # Clean mask
+    k = int(cfg.get("morph_k", 5))
+    if k < 1:
+        k = 1
+    kernel = np.ones((k, k), np.uint8)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    M = cv2.moments(bw)
+    area_px = M["m00"] / 255.0
+    min_area = float(cfg.get("min_area_px", 5000))
+
+    if area_px < min_area:
+        return 0.0, 0.0, 0.0, {"y0": y0, "cx": None, "bw": bw}
+
+    cx = int(M["m10"] / M["m00"])
+    steer = (cx - (w / 2)) / (w / 2)
+    steer = clamp(steer, -1.0, 1.0)
+
+    conf = clamp(area_px / float(cfg.get("conf_area_norm", 20000)), 0.0, 1.0)
+
+    throttle = 0.2 + 0.6 * conf
+    throttle = clamp(throttle, 0.0, 1.0)
+
+    return throttle, steer, conf, {"y0": y0, "cx": cx, "bw": bw}
+
+def main():
+    cfg = load_config()
+    fps = int(cfg.get("fps", 20))
+    dt = 1.0 / max(1, fps)
+
+    alpha = float(cfg.get("ema_alpha", 0.25))
+    conf_stop_frames = int(cfg.get("conf_stop_frames", 8))
+    thr_min = float(cfg.get("throttle_min", 0.15))
+    thr_max = float(cfg.get("throttle_max", 0.80))
+
+    log_path = Path(cfg.get("log_path", str(HOME / "ika" / "logs" / "vision.log"))).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- Frame saving config ---
+    save_frames = bool(cfg.get("save_frames", False))
+    frames_dir = Path(cfg.get("frames_dir", str(HOME / "ika" / "logs" / "frames"))).expanduser()
+    save_every_n = int(cfg.get("save_every_n", 5))
+    max_frames = int(cfg.get("max_frames", 500))
+
+    frame_queue = deque()
+    if save_frames:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+    cam = init_camera()
+    print("[OK] Vision Brain started")
+
+    steer_ema = 0.0
+    lost_cnt = 0
+    frame_i = 0
+
+    with log_path.open("a", encoding="utf-8") as logf:
+        while True:
+            t0 = time.time()
+            frame_i += 1
+
+            frame = cam.capture_array()
+            throttle, steer, conf, dbg = process_frame_to_command(frame, cfg)
+
+            if conf <= 0.01:
+                lost_cnt += 1
+            else:
+                lost_cnt = 0
+
+            if lost_cnt >= conf_stop_frames:
+                throttle = 0.0
+                steer = 0.0
+                conf = 0.0
+
+            steer_ema = (1.0 - alpha) * steer_ema + alpha * steer
+            steer_ema = clamp(steer_ema, -1.0, 1.0)
+
+            if throttle > 0.0:
+                throttle = clamp(throttle, thr_min, thr_max)
+
+            line = f"V,{throttle:.3f},{steer_ema:.3f},{conf:.3f}"
+            print(line)
+            logf.write(line + "\n")
+            logf.flush()
+
+            # --- Save frames (rolling buffer) ---
+            if save_frames and (frame_i % max(1, save_every_n) == 0):
+                ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+                img_path = frames_dir / f"frame_{ts}_{frame_i:06d}.jpg"
+                msk_path = frames_dir / f"mask_{ts}_{frame_i:06d}.png"
+
+                ok1 = cv2.imwrite(str(img_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                ok2 = cv2.imwrite(str(msk_path), dbg["bw"])
+
+                # Track saved files to delete old ones
+                if ok1:
+                    frame_queue.append(img_path)
+                if ok2:
+                    frame_queue.append(msk_path)
+
+                while len(frame_queue) > max_frames * 2:
+                    old = frame_queue.popleft()
+                    try:
+                        if old.exists():
+                            old.unlink()
+                    except Exception:
+                        pass
+
+            if cfg.get("debug_preview", False):
+                vis = frame.copy()
+                y0 = dbg["y0"]
+                cv2.line(vis, (0, y0), (vis.shape[1] - 1, y0), (0, 255, 0), 2)
+
+                if dbg["cx"] is not None:
+                    cx = dbg["cx"]
+                    cv2.line(vis, (cx, y0), (cx, vis.shape[0] - 1), (255, 0, 0), 2)
+
+                txt = f"thr={throttle:.2f} steer={steer_ema:.2f} conf={conf:.2f} lost={lost_cnt}"
+                cv2.putText(vis, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                cv2.imshow("Vision Debug", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+                cv2.imshow("Mask", dbg["bw"])
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            elapsed = time.time() - t0
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+
+if __name__ == "__main__":
+    main()

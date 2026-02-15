@@ -1,0 +1,1 @@
+python ~/ika/src/vision_brain.py
