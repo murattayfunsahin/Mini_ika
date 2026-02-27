@@ -52,7 +52,6 @@ class PIDController:
 # ==============================================================================
 class VideoStream:
     def __init__(self, src=0, width=640, height=480):
-        # libcamera ile calismasi icin GStreamer Pipeline (Pi Camera Module 3)
         gst_pipeline = (
             "libcamerasrc ! "
             f"video/x-raw, width={width}, height={height}, framerate=30/1 ! "
@@ -64,7 +63,6 @@ class VideoStream:
         print("[INFO] GStreamer ile kamera baslatiliyor...")
         self.stream = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
 
-        # Kamera isinana kadar bekle
         time.sleep(2.0)
 
         if self.stream.isOpened():
@@ -100,63 +98,60 @@ class VideoStream:
 
 
 # ==============================================================================
-# CONFIGURATION (PI ICIN - PC TESTTEKI IYILESTIRILMIS YOLO AYARLARI KORUNDU)
+# CONFIGURATION (PI ICIN - PC TESTTEKI AYNI AYAR/MANTIK)
 # ==============================================================================
 class Config:
     # Camera
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
-    MIRROR_VIEW = True  # 2. koddan korundu
+    MIRROR_VIEW = True
 
-    # --- PID SETTINGS (1. kod) ---
+    # --- PID SETTINGS ---
     PID_KP = 0.55
     PID_KI = 0.00
     PID_KD = 0.35
 
-    # --- SPEED SETTINGS (1. kod) ---
+    # --- SPEED SETTINGS ---
     BASE_SPEED = 30
     MAX_TURN_SPEED = 50
 
-    # --- MEMORY (1. kod) ---
+    # --- MEMORY ---
     LANE_WIDTH = 380
 
-    # --- YOLO SETTINGS (2. kod) ---
+    # --- YOLO SETTINGS ---
     MODEL_PATH = "yolov5n.pt"
     IMGSZ = 320
     CONF = 0.50
 
-    # "Yakin engel" cizgisi (2. kod)
+    # Pico yoksa (UART yoksa) testte YOLO'yu acik tut (PC koduyla ayni mantik)
+    YOLO_ALWAYS_ON_WHEN_NO_PICO = True
+
+    # "Yakin engel" cizgisi
     NEAR_Y_RATIO = 0.55
 
-    # Mesafe esikleri (cm) (2. kod)
+    # Mesafe esikleri (cm)
     STOP_CM = 25.0
     AVOID_CM = 80.0
 
-    # ---- Smooth kontrol (YOLO steer daha anlamli ve daha stabil) ----
-    # Not:
-    # - steer siddeti sadece sol/sag farktan degil, nesnenin merkeze yakinligindan da etkilenir
-    # - "hafif sagda" ile "en sagda" arasinda daha gorunur fark verir
+    # ---- Smooth kontrol (YOLO steer) ----
     DEADBAND = 0.10
     SWITCH_HYS = 0.30
     GAIN = 1.15
     STEER_MIN = 0.06
     STEER_MAX = 0.55
 
-    # Direksiyon filtreleri
     EMA_ALPHA = 0.93
     MAX_DELTA = 0.02
 
-    # Hiz ayarlari (2. kod - normalize mantik)
+    # Hiz ayarlari (normalize)
     V_CLEAR = 1.00
     V_MANEUVER = 0.70
     V_REVERSE = -0.60
 
-    # UART / Protokol secimi
-    # "LEGACY"  -> <speed,angle>   (1. kod formati)
-    # "VS"      -> V:0.70;S:-0.35  (2. kod formati)
+    # UART / Protokol
     UART_OUTPUT_MODE = "VS"
 
-    # Pi4 UART (GPIO14/15)
+    # Pi4 UART
     SERIAL_PORT = "/dev/ttyS0"
     BAUD = 115200
 
@@ -182,7 +177,7 @@ except Exception as e:
 def send_command(speed, angle):
     if ser:
         try:
-            angle = max(min(int(angle), 100), -100)  # -100..100
+            angle = max(min(int(angle), 100), -100)
             msg = "<{},{}>\n".format(int(speed), angle)
             ser.write(msg.encode('utf-8'))
         except:
@@ -205,25 +200,20 @@ def clamp(x, lo, hi):
 
 def drive_send_unified(speed_int, angle_int):
     """
-    Karar mekanizmasi hangi modda olursa olsun tek yerden gönderir.
-    - speed_int: 1. kod mantigi (yaklasik -50..50)
-    - angle_int: 1. kod mantigi (-100..100)
+    speed_int: -50..50 civari
+    angle_int: -100..100 civari
     """
-    # Legacy format (1. kod)
     if Config.UART_OUTPUT_MODE == "LEGACY":
         send_command(speed_int, angle_int)
         return
 
-    # VS format (2. kod) icin donusum
-    # speed_int ~ [-50..50] => v ~ [-1..1]
     v = clamp(speed_int / float(Config.MAX_TURN_SPEED), -1.0, 1.0)
     s = clamp(angle_int / 100.0, -1.0, 1.0)
     send_motor_command(v, s)
 
 
 # ==============================================================================
-# PICO'DAN GELEN TELEMETRI PARSING (2. KOD - KORUNDU/PI'YA UYARLANDI)
-# Beklenen örnek: "D=73.2;L=0.0;R=0.0"
+# PICO TELEMETRI PARSING
 # ==============================================================================
 def parse_packet(line: str):
     out = {}
@@ -248,7 +238,6 @@ latest_data = {}
 def pico_read_latest():
     global latest_data
     if ser and ser.in_waiting > 0:
-        # Kuyrukta birikenleri son değere kadar oku (en güncel veri)
         try:
             while ser.in_waiting > 0:
                 line = ser.readline().decode(errors="ignore").strip()
@@ -262,10 +251,6 @@ def pico_read_latest():
 
 
 def get_distance_cm_from_pico(data_dict):
-    """
-    Pico'nun gönderdiği mesafe anahtarı farklı olabilir.
-    Olası anahtarlar: D, DIST, DIST_CM, mesafe, mesafe_cm
-    """
     if not data_dict:
         return 999.0
 
@@ -279,7 +264,7 @@ def get_distance_cm_from_pico(data_dict):
 
 
 # ==============================================================================
-# IMAGE PROCESSING & DYNAMIC ROI (1. KOD - KORUNDU)
+# IMAGE PROCESSING & DYNAMIC ROI
 # ==============================================================================
 def preprocess_image(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -289,19 +274,16 @@ def preprocess_image(image):
 
 
 def dynamic_roi(image, steering_bias):
-    """
-    Direksiyon ne tarafa donukse robot oraya bakar.
-    """
     height, width = image.shape[:2]
 
-    # Bakis acisini kaydir (Shift)
-    shift = int(steering_bias * 0.8)
+    # --- ROI SHIFT CLAMP (PC koduyla ayni) ---
+    bias = clamp(float(steering_bias), -100.0, 100.0)
+    max_shift = int(width * 0.15)
+    shift = int((bias / 100.0) * max_shift)
 
-    # ROI Noktalari
     top_left_x = int(width * 0.1) + shift
     top_right_x = int(width * 0.9) + shift
 
-    # Sinirlandirma
     top_left_x = max(0, min(width, top_left_x))
     top_right_x = max(0, min(width, top_right_x))
 
@@ -329,7 +311,6 @@ def get_lane_lines(lines, width, height, prev_width):
         slope = params[0]
         intercept = params[1]
 
-        # Egim Filtresi (Yatay cizgileri at)
         if abs(slope) < 0.3 or abs(slope) > 3.0:
             continue
 
@@ -358,34 +339,21 @@ def make_coords(image, line_params):
 
 
 # ==============================================================================
-# YOLO / ENGEL LOGIC (2. KOD - HASSASIYET / MAGNITUDE IYILESTIRILDI)
+# YOLO / ENGEL LOGIC
 # ==============================================================================
 def occupancy_scores(results, w, h, near_y_ratio):
-    """
-    Sol/sag doluluk + merkez baskisi (center_pressure) hesaplar.
-
-    center_pressure:
-      0.0 -> nesne/agirlikli merkez kenarlarda
-      1.0 -> nesne/agirlikli merkez ekranda merkeze yakin
-
-    Iyilestirme:
-    - BBox'in TAM alanini saymak yerine sadece near_line altindaki kismi sayiyoruz
-    - BBox'i center cizgisine gore sol/sag alanlara BOLUYORUZ (tek tarafa yazmiyoruz)
-    Bu sayede "hafif sagda" ile "en sagda" arasinda fark olusur.
-    """
     sol, sag = 0.0, 0.0
     near_line = int(h * near_y_ratio)
     center_x = w / 2.0
 
     total_area = 0.0
-    x_moment = 0.0  # agirlikli x merkezi
+    x_moment = 0.0
 
     det = results.xyxy[0].cpu().numpy()
 
     for *xyxy, conf, cls in det:
         x1, y1, x2, y2 = [float(v) for v in xyxy]
 
-        # Goruntu sinirlarina kirp
         x1 = max(0.0, min(float(w), x1))
         x2 = max(0.0, min(float(w), x2))
         y1 = max(0.0, min(float(h), y1))
@@ -394,7 +362,6 @@ def occupancy_scores(results, w, h, near_y_ratio):
         if x2 <= x1 or y2 <= y1:
             continue
 
-        # Sadece near_line altini say
         if y2 <= near_line:
             continue
 
@@ -408,12 +375,10 @@ def occupancy_scores(results, w, h, near_y_ratio):
         if area <= 0:
             continue
 
-        # Agirlikli merkez (center pressure icin)
         cx = (x1 + x2) / 2.0
         total_area += area
         x_moment += cx * area
 
-        # BBox'i center cizgisine gore sol/sag diye bol
         left_w = max(0.0, min(x2, center_x) - x1)
         right_w = max(0.0, x2 - max(x1, center_x))
 
@@ -422,33 +387,29 @@ def occupancy_scores(results, w, h, near_y_ratio):
 
     center_pressure = 0.0
     if total_area > 1e-6:
-        cx_w = x_moment / total_area  # agirlikli merkez x
-        dist_norm = abs(cx_w - center_x) / max(1e-6, center_x)  # 0 merkez, 1 kenar
+        cx_w = x_moment / total_area
+        dist_norm = abs(cx_w - center_x) / max(1e-6, center_x)
         dist_norm = clamp(dist_norm, 0.0, 1.0)
-        center_pressure = 1.0 - dist_norm  # 1 merkezde, 0 kenarda
+        center_pressure = 1.0 - dist_norm
 
     return sol, sag, near_line, center_pressure
 
 
 # ==============================================================================
-# HUD (1. KOD + EK BILGILER)
+# HUD
 # ==============================================================================
 def draw_dashboard(image, error, pid_out, fps, roi_poly,
                    mode_text="", dist_cm=None, yolo_steer=None):
     h, w = image.shape[:2]
 
-    # 1. ROI Cizimi
     if roi_poly is not None:
         cv2.polylines(image, [roi_poly], True, (255, 100, 0), 2)
 
-    # 2. Ust Bilgi Bari (biraz yukselttik)
     cv2.rectangle(image, (0, 0), (w, 95), (0, 0, 0), -1)
 
-    # 3. Veriler
     cv2.putText(image, f"FPS: {int(fps)}", (20, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    # PID bar
     bar_width = int((pid_out / 100) * 100)
     cv2.rectangle(image, (w // 2 - 100, 10), (w // 2 + 100, 30), (100, 100, 100), -1)
     color = (0, 255, 0) if abs(pid_out) < 30 else (0, 0, 255)
@@ -457,11 +418,9 @@ def draw_dashboard(image, error, pid_out, fps, roi_poly,
     cv2.putText(image, f"PID: {pid_out}", (w // 2 - 40, 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    # Mode
     cv2.putText(image, f"MODE: {mode_text}", (20, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    # Distance
     if dist_cm is not None:
         renk = (0, 255, 0)
         if dist_cm < Config.AVOID_CM:
@@ -471,7 +430,6 @@ def draw_dashboard(image, error, pid_out, fps, roi_poly,
         cv2.putText(image, f"DIST: {dist_cm:.1f} cm", (20, 86),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, renk, 2)
 
-    # YOLO steer (HUD ayni kalsin)
     if yolo_steer is not None:
         cv2.putText(image, f"YOLO steer: {yolo_steer:.2f}", (w - 230, 86),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
@@ -480,7 +438,7 @@ def draw_dashboard(image, error, pid_out, fps, roi_poly,
 
 
 # ==============================================================================
-# MAIN PROGRAM (BIRLESTIRILMIS)
+# MAIN
 # ==============================================================================
 def main():
     print("[INFO] KAMERA BASLATILIYOR (LIBCAMERA MODU)...")
@@ -495,31 +453,30 @@ def main():
         print("[FATAL] Kamera baslatilamadi. Gstreamer yuklu mu?")
         return
 
-    # Kameranin isinmasi icin bekle
     time.sleep(1.0)
 
-    # PID init (1. kod)
     pid = PIDController(Config.PID_KP, Config.PID_KI, Config.PID_KD)
     error_buffer = deque(maxlen=5)
 
-    # FPS
     fps_start = time.time()
     frame_count = 0
     fps = 0
 
-    # Lane memory
     avg_width = Config.LANE_WIDTH
     last_steer_pid = 0
 
-    # YOLO state
     steer_prev = 0.0
     yon_kilit = 0
     model = None
 
     print("[INFO] YOLO model yukleniyor...")
     try:
-        # ilk calistirmada internetten indirebilir / yavas olabilir
-        model = torch.hub.load('ultralytics/yolov5', 'custom', path=Config.MODEL_PATH)
+        # PC koduyla ayni: dosya yoksa pretrained fallback
+        if os.path.exists(Config.MODEL_PATH):
+            model = torch.hub.load('ultralytics/yolov5', 'custom', path=Config.MODEL_PATH)
+        else:
+            model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True)
+
         model.conf = Config.CONF
         print("[INFO] YOLO hazir.")
     except Exception as e:
@@ -529,39 +486,32 @@ def main():
     print("[INFO] TEMIRBUG PRO + YOLO SISTEM BASLADI")
     print("[INFO] Cikmak icin 'q' tusuna basin.")
 
-    # son komut (lane kaybında istenirse tutulur)
     last_sent_speed = 0
     last_sent_angle = 0
 
+    lane_lost_frames = 0
+
     try:
         while True:
-            # ------------------------------------------------------------------
-            # A) KARE AL
-            # ------------------------------------------------------------------
             frame = vs.read()
             if frame is None:
                 continue
 
-            # 2. koddaki mirror davranisi (opsiyon)
             if Config.MIRROR_VIEW:
                 frame = cv2.flip(frame, 1)
 
-            # FPS hesabı
+            # PC koduyla ayni: gercek boyut
+            frame_h, frame_w = frame.shape[:2]
+
             frame_count += 1
             if time.time() - fps_start > 1:
                 fps = frame_count
                 frame_count = 0
                 fps_start = time.time()
 
-            # ------------------------------------------------------------------
-            # B) PICO TELEMETRI (MESAFE)
-            # ------------------------------------------------------------------
             pico_data = pico_read_latest()
             mesafe_cm = get_distance_cm_from_pico(pico_data)
 
-            # ------------------------------------------------------------------
-            # C) LANE FOLLOWING (1. KOD MANTIGI - HESAPLANIR)
-            # ------------------------------------------------------------------
             edges = preprocess_image(frame)
             roi_edges, roi_poly = dynamic_roi(edges, last_steer_pid)
 
@@ -571,16 +521,15 @@ def main():
             )
 
             left_p, right_p, avg_width = get_lane_lines(
-                lines, Config.FRAME_WIDTH, Config.FRAME_HEIGHT, avg_width
+                lines, frame_w, frame_h, avg_width
             )
 
-            center_x = Config.FRAME_WIDTH // 2
+            center_x = frame_w // 2
             lane_center = None
 
             l_coords = make_coords(frame, left_p)
             r_coords = make_coords(frame, right_p)
 
-            # lane hesap çıktıları (karar mekanizmasında kullanılacak)
             lane_pid_output = 0
             lane_speed_cmd = 0
             lane_available = False
@@ -591,11 +540,9 @@ def main():
                 current_w = r_coords[1][0] - l_coords[1][0]
                 avg_width = int(avg_width * 0.95 + current_w * 0.05)
                 lane_available = True
-
             elif l_coords:
                 lane_center = int(l_coords[1][0] + (avg_width / 2))
                 lane_available = True
-
             elif r_coords:
                 lane_center = int(r_coords[1][0] - (avg_width / 2))
                 lane_available = True
@@ -608,19 +555,23 @@ def main():
                 lane_pid_output = pid.compute(lane_error_smooth)
                 last_steer_pid = lane_pid_output
 
-                # Dinamik hiz kontrolu (1. kod)
                 turn_strength = abs(lane_pid_output)
                 lane_speed_cmd = Config.BASE_SPEED - int(turn_strength * 0.2)
                 lane_speed_cmd = max(15, lane_speed_cmd)
 
-            # ------------------------------------------------------------------
-            # D) YOLO / ENGEL KACIS (2. KOD MANTIGI - GEREKLIYSE)
-            # ------------------------------------------------------------------
-            yolo_gerekli = (mesafe_cm < Config.AVOID_CM)
+            if lane_available:
+                lane_lost_frames = 0
+            else:
+                lane_lost_frames += 1
+
+            # YOLO gerekli mi? (PC koduyla ayni)
+            if (not PICO_BAGLI) and Config.YOLO_ALWAYS_ON_WHEN_NO_PICO:
+                yolo_gerekli = True
+            else:
+                yolo_gerekli = (mesafe_cm < Config.AVOID_CM)
 
             yolo_steer = 0.0
-            yolo_total_occ = 0.0
-            yolo_near_line = int(Config.FRAME_HEIGHT * Config.NEAR_Y_RATIO)
+            yolo_near_line = int(frame_h * Config.NEAR_Y_RATIO)
             yolo_komut_metni = "YOL ACIK"
             yolo_renk = (0, 255, 0)
             annotated_frame = frame.copy()
@@ -629,36 +580,33 @@ def main():
                 try:
                     results = model(frame, size=Config.IMGSZ)
 
-                    # Tespit kutularını çiz
-                    annotated_frame = np.squeeze(results.render())
+                    # PC koduyla ayni: render stabil
+                    rendered = results.render()
+                    if isinstance(rendered, list) and len(rendered) > 0:
+                        annotated_frame = rendered[0]
+                    else:
+                        annotated_frame = rendered
 
                     sol_puan, sag_puan, yolo_near_line, center_pressure = occupancy_scores(
-                        results, Config.FRAME_WIDTH, Config.FRAME_HEIGHT, Config.NEAR_Y_RATIO
+                        results, frame_w, frame_h, Config.NEAR_Y_RATIO
                     )
                     toplam = sol_puan + sag_puan
-                    yolo_total_occ = toplam
 
                     if toplam > 1e-6:
                         balance_ratio = abs(sol_puan - sag_puan) / toplam
                         hedef_yon = -1 if sol_puan < sag_puan else +1
 
-                        # Yon kilidi: gereksiz sag-sol ziplamalar azalir
                         if yon_kilit == 0 or (hedef_yon != yon_kilit and balance_ratio > Config.SWITCH_HYS):
                             yon_kilit = hedef_yon
 
                         steer_raw = 0.0
 
-                        # Yeni magnitude sinyali:
-                        # - center_pressure ana etken (merkeze girince daha guclu kacis)
-                        # - balance_ratio yan etken (hangi taraf daha dolu guveni)
                         mag_signal = (0.80 * center_pressure) + (0.20 * balance_ratio)
                         mag_signal = clamp(mag_signal, 0.0, 1.0)
 
                         if mag_signal >= Config.DEADBAND:
                             x = (mag_signal - Config.DEADBAND) / max(1e-6, (1.0 - Config.DEADBAND))
                             x = clamp(x, 0.0, 1.0)
-
-                            # Easing (lineer degil): kademeli buyume
                             x_soft = x * x
 
                             mag = Config.STEER_MIN + (Config.STEER_MAX - Config.STEER_MIN) * x_soft * Config.GAIN
@@ -672,29 +620,21 @@ def main():
                             else:
                                 yolo_komut_metni = "SAGA KAC >>>"
 
-                        # Smooth filtreleme
                         steer_ema = (Config.EMA_ALPHA * steer_prev) + ((1 - Config.EMA_ALPHA) * steer_raw)
                         delta = clamp(steer_ema - steer_prev, -Config.MAX_DELTA, Config.MAX_DELTA)
                         yolo_steer = clamp(steer_prev + delta, -Config.STEER_MAX, Config.STEER_MAX)
                         steer_prev = yolo_steer
                     else:
-                        # Yakinda engel yoksa steer sifira yumuşat
                         steer_ema = (Config.EMA_ALPHA * steer_prev)
                         delta = clamp(steer_ema - steer_prev, -Config.MAX_DELTA, Config.MAX_DELTA)
                         yolo_steer = clamp(steer_prev + delta, -Config.STEER_MAX, Config.STEER_MAX)
                         steer_prev = yolo_steer
 
                 except Exception:
-                    # YOLO frame bazli hata verirse sistemi dusurme
-                    # Lane takibi devam etsin
                     pass
 
-            # ------------------------------------------------------------------
-            # E) GORSEL (tek pencere) - YOLO kutulari varsa onlarin ustune lane HUD
-            # ------------------------------------------------------------------
             final_view = annotated_frame.copy()
 
-            # 1. kod lane çizimleri
             if l_coords:
                 color_l = (0, 255, 0) if r_coords else (0, 255, 255)
                 cv2.line(final_view, l_coords[0], l_coords[1], color_l, 5)
@@ -703,57 +643,48 @@ def main():
                 cv2.line(final_view, r_coords[0], r_coords[1], color_r, 5)
 
             if lane_center is not None:
-                cv2.circle(final_view, (lane_center, int(Config.FRAME_HEIGHT * 0.65)), 10, (0, 0, 255), -1)
+                cv2.circle(final_view, (lane_center, int(frame_h * 0.65)), 10, (0, 0, 255), -1)
             else:
                 cv2.putText(final_view, "KAYIP!", (260, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 5)
 
-            # 2. koddaki near obstacle çizgisi
-            cv2.line(final_view, (0, yolo_near_line), (Config.FRAME_WIDTH, yolo_near_line), (255, 0, 0), 2)
+            cv2.line(final_view, (0, yolo_near_line), (frame_w, yolo_near_line), (255, 0, 0), 2)
 
-            # ------------------------------------------------------------------
-            # F) KARAR MEKANIZMASI (ASIL BIRLESTIRME NOKTASI)
-            # ------------------------------------------------------------------
             mode = "LANE"
             cmd_speed = 0
             cmd_angle = 0
 
-            # 1) Cok yakin engel -> güvenlik/geri manevra
             if mesafe_cm <= Config.STOP_CM:
                 mode = "EMERGENCY_REVERSE"
-                cmd_speed = int(Config.V_REVERSE * Config.MAX_TURN_SPEED)  # örn: -30
-                # yolo_steer (±STEER_MAX) -> angle (±90)
+                cmd_speed = int(Config.V_REVERSE * Config.MAX_TURN_SPEED)
                 cmd_angle = int(clamp((yolo_steer / max(1e-6, Config.STEER_MAX)) * 90.0, -90.0, 90.0))
 
-            # 2) Engel yakın -> YOLO kaçış modu
             elif mesafe_cm < Config.AVOID_CM and model is not None:
                 mode = "YOLO_AVOID"
-                cmd_speed = int(Config.V_MANEUVER * Config.MAX_TURN_SPEED)  # örn: +35
-                # yolo_steer (±STEER_MAX) -> angle (±90)
+                cmd_speed = int(Config.V_MANEUVER * Config.MAX_TURN_SPEED)
                 cmd_angle = int(clamp((yolo_steer / max(1e-6, Config.STEER_MAX)) * 90.0, -90.0, 90.0))
 
-            # 3) Yol açık -> Lane PID modu
             else:
                 if lane_available:
                     mode = "LANE_PID"
                     cmd_speed = lane_speed_cmd
                     cmd_angle = lane_pid_output
                 else:
-                    # Şerit kayıp: orijinal davranışı bozmamak için son komutu koru (hold)
-                    mode = "LANE_LOST_HOLD"
-                    cmd_speed = last_sent_speed
-                    cmd_angle = last_sent_angle
+                    # PC koduyla ayni: SAFE lane lost
+                    mode = "LANE_LOST_SAFE"
+                    if lane_lost_frames > 30:
+                        cmd_speed = 0
+                        cmd_angle = 0
+                    else:
+                        cmd_speed = int(last_sent_speed * 0.50)
+                        cmd_angle = int(last_sent_angle * 0.70)
 
-            # Komutu gönder
             drive_send_unified(cmd_speed, cmd_angle)
             last_sent_speed, last_sent_angle = cmd_speed, cmd_angle
 
-            # ------------------------------------------------------------------
-            # G) EKRAN BILGILERI (YOLO + LANE + MODE)
-            # ------------------------------------------------------------------
-            cv2.putText(final_view, f"Komut: {yolo_komut_metni}", (20, Config.FRAME_HEIGHT - 45),
+            cv2.putText(final_view, f"Komut: {yolo_komut_metni}", (20, frame_h - 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, yolo_renk, 2)
-            cv2.putText(final_view, f"YOLO Steer: {yolo_steer:.2f}", (20, Config.FRAME_HEIGHT - 15),
+            cv2.putText(final_view, f"YOLO Steer: {yolo_steer:.2f}", (20, frame_h - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             draw_dashboard(
